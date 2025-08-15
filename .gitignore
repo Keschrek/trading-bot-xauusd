@@ -1,1 +1,40 @@
-# Git ignore rules
+# OS
+.DS_Store
+Thumbs.db
+# Editors/IDE
+.vscode/
+.idea/
+*.code-workspace
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# Node
+node_modules/
+dist/
+# MT5 / Backtests / Builds
+*.ex5
+*.ex4
+*.obj
+*.log
+*.hst
+*.dat
+*.cache
+*.tmp
+MQL5/Logs/
+MQL5/Profiles/
+MQL5/Tester/
+StrategyTester/
+tester/agent*/logs/
+# Data
+data/raw/
+data/processed/
+tests/output/
+logs/
+backtests/
+# Secrets
+configs/*secret*.json
+configs/*secret*.yaml
+.env
+.env.*

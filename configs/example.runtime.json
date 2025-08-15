@@ -1,1 +1,8 @@
-{}
+// file: configs/example.runtime.json
+{
+  "symbol": "XAUUSD",
+  "timeframes": { "filter": "H1", "signal": "M15" },
+  "risk": { "risk_per_trade": 0.5, "atr_mult_sl": 1.8, "tp_rr": 1.6 },
+  "news_filter": { "enabled": true, "pre_minutes": 15, "post_minutes": 15 },
+  "gpt_mode": { "enabled": false, "endpoint": "http://localhost:8000", "timeout_ms": 1500 }
+}

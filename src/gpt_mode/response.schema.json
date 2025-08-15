@@ -1,1 +1,9 @@
-{}
+// file: src/gpt_mode/response.schema.json
+{
+  "market_regime": "trending|ranging|uncertain",
+  "trade_readiness_score": 0,
+  "direction": "long|short|flat",
+  "indicator_params": {},
+  "risk_overrides": {},
+  "notes": ""
+}
