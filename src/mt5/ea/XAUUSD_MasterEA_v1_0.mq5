@@ -1,6 +1,6 @@
 // file: src/mt5/ea/XAUUSD_MasterEA_v1_0.mq5
 #property strict
-#property version   "0.9.0"
+#property version   "001.000"
 #property description "XAU/USD Scalping-Bot – feature-komplett gem. Pflichtenheft (ohne externe KI-Anbindung)"
 #property copyright  "MIT"
 
@@ -204,7 +204,7 @@ void ResetDayIfNeeded()
     g_dayAnchor = StructToTime((MqlDateTime){t.year,t.mon,t.day,0,0,0});
     g_dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
     g_mode = MODE_NORMAL; // Tagesreset
-    LogRow("DAY_RESET","ModeManager","RESET","Normal","-",0,0,0,0,0,0,0,0,0,0,0,true,"new day");
+    LogRow("DAY_RESET","ModeManager","RESET","Normal","-",0,0,0, 0,0,0,0, 0,0, 0,0, 0, true, "new day");
   }
 }
 double TodayPnL(){ return AccountInfoDouble(ACCOUNT_EQUITY) - g_dayStartEquity; }
@@ -402,13 +402,13 @@ void OnTick()
 
   // Fenster / News / Safe
   if(!InTradeWindow())
-  { LogRow("WINDOW_BLOCK","ModeManager","BLOCK",ModeName(),"-",0,0,0,0,0,0,0,0,0,0,0,true,"outside window"); ManagePositions(); return; }
+  { LogRow("WINDOW_BLOCK","ModeManager","BLOCK",ModeName(),"-",0,0,0, 0,0,0,0, 0,0, 0,0, 0, true, "outside window"); ManagePositions(); return; }
 
   if(IsTradingPausedByNews())
-  { g_mode = MODE_SAFE; LogRow("NEWS_BLOCK","NewsFilter","BLOCK",ModeName(),"-",0,0,0,0,0,0,0,0,0,0,0,true,"news window"); ManagePositions(); return; }
+  { g_mode = MODE_SAFE; LogRow("NEWS_BLOCK","NewsFilter","BLOCK",ModeName(),"-",0,0,0, 0,0,0,0, 0,0, 0,0, 0, true, "news window"); ManagePositions(); return; }
 
   if(DailyLossExceeded())
-  { g_mode = MODE_SAFE; LogRow("SAFE_MODE","RiskControl","BLOCK","Safe","-",0,0,0,0,0,0,0,0,0,0,0,true,"daily loss"); ManagePositions(); return; }
+  { g_mode = MODE_SAFE; LogRow("SAFE_MODE","RiskControl","BLOCK","Safe","-",0,0,0, 0,0,0,0, 0,0, 0,0, 0, true, "daily loss"); ManagePositions(); return; }
 
   // Hauptfilter
   bool fTrend=false,fStrength=false,fMomentum=false;
