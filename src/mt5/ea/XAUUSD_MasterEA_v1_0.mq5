@@ -1,7 +1,7 @@
 // file: src/mt5/ea/XAUUSD_MasterEA_v1_0.mq5
 #property strict
 #property version   "001.000"
-#property description "XAU/USD Scalping-Bot – feature-komplett gem. Pflichtenheft (ohne externe KI-Anbindung)"
+#property description "XAU/USD Scalping-Bot – v0.9 (fixes for MQL5 handles, logging, news, trailing)"
 #property copyright  "MIT"
 
 #include <Trade/Trade.mqh>
@@ -55,7 +55,7 @@ datetime g_lastM1CloseTime = 0;
 int      g_digits = 2;
 double   g_point  = 0.01;
 
-// ======= Utils =======
+// ======= Utils & Logging =======
 double Clamp(double v,double lo,double hi){ return MathMax(lo,MathMin(hi,v)); }
 string TodayCsv(){ return InpLogFilePrefix + TimeToString(TimeCurrent(),TIME_DATE) + ".csv"; }
 
@@ -103,51 +103,52 @@ bool InTradeWindow()
   return (nowMin>=sMin && nowMin<=eMin);
 }
 
-// ======= Init / Deinit =======
-int OnInit()
+// ======= Series Helpers (MQL5: CopyBuffer) =======
+double MaValue(ENUM_TIMEFRAMES tf,int period,ENUM_MA_METHOD method=MODE_EMA,int price_type=PRICE_CLOSE,int shift=0)
 {
-  if(!SymbolSelect(InpSymbol,true)) return(INIT_FAILED);
-  g_digits = (int)SymbolInfoInteger(InpSymbol,SYMBOL_DIGITS);
-  g_point  = SymbolInfoDouble(InpSymbol,SYMBOL_POINT);
-
-  g_handleATR  = iATR(InpSymbol, InpTF_Work, InpATR_Period);
-  g_handleMACD = iMACD(InpSymbol, InpTF_Work, 12,26,9, PRICE_CLOSE);
-  if(g_handleATR==INVALID_HANDLE || g_handleMACD==INVALID_HANDLE) return(INIT_FAILED);
-
-  EnsureLogHeader();
-
-  // Tagesanker/Equity merken
-  MqlDateTime t; TimeToStruct(TimeCurrent(),t);
-  t.hour=0; t.min=0; t.sec=0; g_dayAnchor = StructToTime(t);
-  g_dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-
-  Print("[EA] Init OK v0.9 | Symbol=",InpSymbol);
-  return(INIT_SUCCEEDED);
+  int h=iMA(InpSymbol,tf,period,0,method,price_type);
+  if(h==INVALID_HANDLE) return 0.0;
+  double b[]; ArraySetAsSeries(b,true);
+  int copied=CopyBuffer(h,0,shift,1,b);
+  IndicatorRelease(h);
+  if(copied<1) return 0.0;
+  return b[0];
 }
-void OnDeinit(const int reason)
+double GetATR()
 {
-  if(g_handleATR!=INVALID_HANDLE)  IndicatorRelease(g_handleATR);
-  if(g_handleMACD!=INVALID_HANDLE) IndicatorRelease(g_handleMACD);
+  double b[]; ArraySetAsSeries(b,true);
+  if(CopyBuffer(g_handleATR,0,0,1,b)<1) return 0.0;
+  return b[0];
+}
+double GetMACDHist()
+{
+  double h[]; ArraySetAsSeries(h,true);
+  if(CopyBuffer(g_handleMACD,2,0,1,h)<1) return 0.0;
+  return h[0];
+}
+double GetRSI(ENUM_TIMEFRAMES tf,int period=14)
+{
+  int h=iRSI(InpSymbol,tf,period,PRICE_CLOSE); if(h==INVALID_HANDLE) return 50.0;
+  double r[]; ArraySetAsSeries(r,true);
+  int copied=CopyBuffer(h,0,0,1,r); IndicatorRelease(h);
+  if(copied<1) return 50.0;
+  return r[0];
 }
 
-// ======= Indicators / Helpers =======
-double GetATR(){ double b[]; ArraySetAsSeries(b,true); if(CopyBuffer(g_handleATR,0,0,2,b)<2) return 0; return b[0]; }
-double GetMACDHist(){ double h[]; ArraySetAsSeries(h,true); if(CopyBuffer(g_handleMACD,2,0,2,h)<2) return 0; return h[0]; }
-double GetRSI(ENUM_TIMEFRAMES tf,int period=14){ int h=iRSI(InpSymbol,tf,period,PRICE_CLOSE); if(h==INVALID_HANDLE) return 50; double r[]; ArraySetAsSeries(r,true); if(CopyBuffer(h,0,0,2,r)<2){ IndicatorRelease(h); return 50; } double v=r[0]; IndicatorRelease(h); return v; }
-
+// ======= Trend/Momentum Helpers =======
 bool EmaBiasOK_TF(ENUM_TIMEFRAMES tf,int fast,int slow)
 {
-  double f=iMA(InpSymbol,tf,fast,0,MODE_EMA,PRICE_CLOSE,0);
-  double s=iMA(InpSymbol,tf,slow,0,MODE_EMA,PRICE_CLOSE,0);
+  double f=MaValue(tf,fast,MODE_EMA,PRICE_CLOSE,0);
+  double s=MaValue(tf,slow,MODE_EMA,PRICE_CLOSE,0);
   if(f==0 || s==0) return false;
   return (f>s);
 }
 bool EmaCross_TF(ENUM_TIMEFRAMES tf,int fast,int slow)
 {
-  double f0=iMA(InpSymbol,tf,fast,0,MODE_EMA,PRICE_CLOSE,0);
-  double s0=iMA(InpSymbol,tf,slow,0,MODE_EMA,PRICE_CLOSE,0);
-  double f1=iMA(InpSymbol,tf,fast,0,MODE_EMA,PRICE_CLOSE,1);
-  double s1=iMA(InpSymbol,tf,slow,0,MODE_EMA,PRICE_CLOSE,1);
+  double f0=MaValue(tf,fast,MODE_EMA,PRICE_CLOSE,0);
+  double s0=MaValue(tf,slow,MODE_EMA,PRICE_CLOSE,0);
+  double f1=MaValue(tf,fast,MODE_EMA,PRICE_CLOSE,1);
+  double s1=MaValue(tf,slow,MODE_EMA,PRICE_CLOSE,1);
   return ( (f1<=s1 && f0>s0) || (f1>=s1 && f0<s0) );
 }
 bool VolumeSpike()
@@ -176,7 +177,6 @@ bool EvaluateHTFBias()
   bool ok = EmaBiasOK_TF(InpTF_HTF,50,200);
   return InpHTF_Gate_Strict ? ok : (ok || true);
 }
-
 void ComputeQualityScore(double &longScore,double &shortScore)
 {
   longScore=0; shortScore=0;
@@ -194,14 +194,15 @@ void ComputeDirectionScore(double &longScore,double &shortScore)
 }
 void ApplyMetaAdjust(double &adjLong,double &adjShort){ adjLong=0.0; adjShort=0.0; } // externe KI noch nicht angebunden
 
-// ======= ModeManager =======
+// ======= ModeManager / Day Handling =======
 void ResetDayIfNeeded()
 {
   MqlDateTime t; TimeToStruct(TimeCurrent(),t);
   MqlDateTime d; TimeToStruct(g_dayAnchor,d);
-  if(t.day!=d.day || t.mon!=d.mon || t.year!=d.year)
+  if(t.day!=d.day || t.mon!=d.mon || t.year!=d.year || g_dayAnchor==0)
   {
-    g_dayAnchor = StructToTime((MqlDateTime){t.year,t.mon,t.day,0,0,0});
+    MqlDateTime z=t; z.hour=0; z.min=0; z.sec=0;
+    g_dayAnchor = StructToTime(z);
     g_dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
     g_mode = MODE_NORMAL; // Tagesreset
     LogRow("DAY_RESET","ModeManager","RESET","Normal","-",0,0,0, 0,0,0,0, 0,0, 0,0, 0, true, "new day");
@@ -223,61 +224,59 @@ double QualMinByMode()
   return InpQual_Min_Normal;
 }
 
-// ======= News Filter (JSON/CSV) =======
-bool ParseNextEventMinutes(int &mins_to_event,bool &recent,bool &highimpact)
+// ======= News Filter (JSON/CSV – einfache Parser) =======
+bool ParseNextEventMinutes(int &mins_to_event,bool &window,bool &highimpact)
 {
-  mins_to_event = 9999; recent=false; highimpact=false;
+  mins_to_event = 9999; window=false; highimpact=false;
   if(!InpUseNewsFilter) return false;
 
   string f=InpNewsFile;
   int h=FileOpen(f,FILE_READ|FILE_ANSI); if(h==INVALID_HANDLE) return false;
-  string content = FileReadString(h, (int)FileSize(h)); FileClose(h);
+  string content = FileReadString(h,(int)FileSize(h)); FileClose(h);
 
-  // CSV fallback: "YYYY-MM-DD HH:MM;impact"
-  if(StringFind(StringToLower(f),".csv")>=0)
+  string lower = StringToLower(f);
+  // CSV: lines "YYYY-MM-DD HH:MM;impact"
+  if(StringFind(lower,".csv")>=0)
   {
-    int p=0;
-    while(p<StringLen(content))
+    string lines[]; int n=StringSplit(content,'\n',lines);
+    for(int i=0;i<n;i++)
     {
-      string line=StringTrim(StringSubstr(content,p,StringFind(content,"\n",p)-p));
-      if(line!="")
-      {
-        int sep = StringFind(line,";");
-        if(sep>0)
-        {
-          string ts = StringSubstr(line,0,sep);
-          string imp= StringSubstr(line,sep+1);
-          datetime ev = StringToTime(ts);
-          int diff = (int)((ev - TimeCurrent())/60);
-          mins_to_event = MathMin(mins_to_event, diff);
-          if(diff>=-InpNewsPostBlockMin && diff<=InpNewsPreBlockMin) recent=true;
-          if(StringFind(StringToLower(imp),"high")>=0) highimpact=true;
-        }
-      }
-      int nl = StringFind(content,"\n",p);
-      if(nl<0) break; p = nl+1;
+      string line=lines[i]; StringTrimLeft(line); StringTrimRight(line);
+      if(StringLen(line)<10) continue;
+      string parts[]; int m=StringSplit(line,';',parts); if(m<1) continue;
+      string ts=parts[0]; string imp=(m>=2?parts[1]:"");
+      datetime ev=StringToTime(ts);
+      int diff=(int)((ev-TimeCurrent())/60);
+      if(diff<mins_to_event) mins_to_event=diff;
+      if(diff>=-InpNewsPostBlockMin && diff<=InpNewsPreBlockMin) window=true;
+      if(StringFind(StringToLower(imp),"high")>=0) highimpact=true;
     }
     return true;
   }
 
-  // primitive JSON: [{"time":"YYYY-MM-DD HH:MM","impact":"high|medium|low"}, ...]
-  int pos=0;
+  // JSON (sehr simpel): find occurrences of "time":"...","impact":"..."
+  int pos=0; bool any=false;
   while(true)
   {
-    int tpos = StringFind(content,"\"time\"",pos); if(tpos<0) break;
-    int q1 = StringFind(content,"\"", tpos+6); int q2 = StringFind(content,"\"", q1+1);
-    string ts = StringSubstr(content, q1+1, q2-q1-1);
-    int ipos = StringFind(content,"\"impact\"",q2); if(ipos<0) break;
-    int i1 = StringFind(content,"\"", ipos+8); int i2 = StringFind(content,"\"", i1+1);
-    string imp= StringSubstr(content, i1+1, i2-i1-1);
-    datetime ev= StringToTime(ts);
+    int tpos=StringFind(content,"\"time\"",pos); if(tpos<0) break;
+    int q1 = StringFind(content,"\"", tpos+6); if(q1<0) break;
+    int q2 = StringFind(content,"\"", q1+1); if(q2<0) break;
+    string ts = StringSubstr(content,q1+1,q2-q1-1);
+
+    int ipos=StringFind(content,"\"impact\"",q2); if(ipos<0) { pos=q2+1; any=true; continue; }
+    int i1 = StringFind(content,"\"", ipos+8); if(i1<0) { pos=q2+1; any=true; continue; }
+    int i2 = StringFind(content,"\"", i1+1); if(i2<0) { pos=q2+1; any=true; continue; }
+    string imp=StringSubstr(content,i1+1,i2-i1-1);
+
+    datetime ev=StringToTime(ts);
     int diff=(int)((ev-TimeCurrent())/60);
-    mins_to_event = MathMin(mins_to_event, diff);
-    if(diff>=-InpNewsPostBlockMin && diff<=InpNewsPreBlockMin) recent=true;
+    if(diff<mins_to_event) mins_to_event=diff;
+    if(diff>=-InpNewsPostBlockMin && diff<=InpNewsPreBlockMin) window=true;
     if(StringFind(StringToLower(imp),"high")>=0) highimpact=true;
-    pos=i2+1;
+
+    pos=i2+1; any=true;
   }
-  return true;
+  return any;
 }
 bool IsTradingPausedByNews()
 {
@@ -317,22 +316,29 @@ bool GateByScores(double qualApplied,double dir,string &noteOut)
 void OpenSplit(ENUM_ORDER_TYPE type,double baseLots,double slPts,double qL,double qS,double dL,double dS,double aL,double aS,double qaL,double qaS,string note,int splitIndex)
 {
   if(baseLots<=0) return;
-  double price = (type==ORDER_TYPE_BUY)? g_tick.ask : g_tick.bid;
-  double sl    = (type==ORDER_TYPE_BUY)? price - slPts*g_point : price + slPts*g_point;
 
-  double lots = baseLots;
+  double slPrice=0.0;
+  if(!SymbolInfoTick(InpSymbol,g_tick)) return;
+
   // simple scale-in: 1st 60%, 2nd 25%, 3rd 15%
+  double lots = baseLots;
   if(splitIndex==1) lots*=0.60;
   if(splitIndex==2) lots*=0.25;
   if(splitIndex==3) lots*=0.15;
 
-  Trade.SetStopLossPrice(sl); Trade.SetTakeProfitPrice(0.0);
-  bool ok = (type==ORDER_TYPE_BUY) ? Trade.Buy(lots,InpSymbol,price,sl,0.0,note)
-                                   : Trade.Sell(lots,InpSymbol,price,sl,0.0,note);
-
-  LogRow(ok?"ENTRY_OK":"ENTRY_FAIL","EntryManager", ok?"OPEN":"FAIL", ModeName(),
-         (type==ORDER_TYPE_BUY?"LONG":"SHORT"), price, sl, 0.0,
-         qL,qS,dL,dS,aL,aS,qaL,qaS, 0,true, note + " split="+IntegerToString(splitIndex));
+  if(type==ORDER_TYPE_BUY){
+    slPrice = g_tick.ask - slPts*g_point;
+    bool ok = Trade.Buy(lots,InpSymbol,0.0,slPrice,0.0,note);
+    LogRow(ok?"ENTRY_OK":"ENTRY_FAIL","EntryManager", ok?"OPEN":"FAIL", ModeName(),
+           "LONG", (double)g_tick.ask, slPrice, 0.0,
+           qL,qS,dL,dS,aL,aS,qaL,qaS, 0,true, note + " split="+IntegerToString(splitIndex));
+  } else {
+    slPrice = g_tick.bid + slPts*g_point;
+    bool ok = Trade.Sell(lots,InpSymbol,0.0,slPrice,0.0,note);
+    LogRow(ok?"ENTRY_OK":"ENTRY_FAIL","EntryManager", ok?"OPEN":"FAIL", ModeName(),
+           "SHORT", (double)g_tick.bid, slPrice, 0.0,
+           qL,qS,dL,dS,aL,aS,qaL,qaS, 0,true, note + " split="+IntegerToString(splitIndex));
+  }
 }
 
 void TryEnter(string bias, double qL,double qS,double dL,double dS,double aL,double aS,double qaL,double qaS)
@@ -341,7 +347,10 @@ void TryEnter(string bias, double qL,double qS,double dL,double dS,double aL,dou
   double slPts = MathMax((atr*InpATR_Mult_SL)/g_point, 100.0);
   double baseLots = CalcLotByRisk(slPts);
 
-  if(baseLots<=0){ LogRow("ENTRY_BLOCK","EntryManager","BLOCK",ModeName(),bias,0,0,0,qL,qS,dL,dS,aL,aS,qaL,qaS,0,true,"lot calc failed"); return; }
+  if(baseLots<=0){
+    LogRow("ENTRY_BLOCK","EntryManager","BLOCK",ModeName(),bias,0,0,0,qL,qS,dL,dS,aL,aS,qaL,qaS,0,true,"lot calc failed");
+    return;
+  }
 
   bool split = (qaL>=InpSplitEntry_Min || qaS>=InpSplitEntry_Min) && (g_mode==MODE_NORMAL || g_mode==MODE_POSTTARGET);
 
@@ -362,6 +371,8 @@ void TryEnter(string bias, double qL,double qS,double dL,double dS,double aL,dou
 void ManagePositions()
 {
   if(!InpUseSmartTrailing) return;
+  if(!SymbolInfoTick(InpSymbol,g_tick)) return;
+
   for(int i=PositionsTotal()-1;i>=0;--i)
   {
     ulong t=PositionGetTicket(i); if(!PositionSelectByTicket(t)) continue;
@@ -383,10 +394,40 @@ void ManagePositions()
   }
 }
 
-// ======= News / Safety =======
+// ======= Safety =======
 bool DailyLossExceeded(){ return TodayPnL() <= -InpDailyLossStopEUR; }
 
 // ======= Main Loop =======
+void OnInitCommon()
+{
+  if(!SymbolSelect(InpSymbol,true)) { Print("SymbolSelect failed"); }
+  g_digits = (int)SymbolInfoInteger(InpSymbol,SYMBOL_DIGITS);
+  g_point  = SymbolInfoDouble(InpSymbol,SYMBOL_POINT);
+
+  g_handleATR  = iATR(InpSymbol, InpTF_Work, InpATR_Period);
+  g_handleMACD = iMACD(InpSymbol, InpTF_Work, 12,26,9, PRICE_CLOSE);
+
+  EnsureLogHeader();
+
+  // Tagesanker/Equity merken
+  MqlDateTime t; TimeToStruct(TimeCurrent(),t);
+  MqlDateTime z=t; z.hour=0; z.min=0; z.sec=0; g_dayAnchor = StructToTime(z);
+  g_dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+  Print("[EA] Init OK v0.9 | Symbol=",InpSymbol);
+}
+int OnInit()
+{
+  OnInitCommon();
+  if(g_handleATR==INVALID_HANDLE || g_handleMACD==INVALID_HANDLE) return(INIT_FAILED);
+  return(INIT_SUCCEEDED);
+}
+void OnDeinit(const int reason)
+{
+  if(g_handleATR!=INVALID_HANDLE)  IndicatorRelease(g_handleATR);
+  if(g_handleMACD!=INVALID_HANDLE) IndicatorRelease(g_handleMACD);
+}
+
 void OnTick()
 {
   if(!SymbolInfoTick(InpSymbol,g_tick)) return;
