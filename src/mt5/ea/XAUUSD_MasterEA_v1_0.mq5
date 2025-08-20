@@ -71,6 +71,19 @@ void EnsureLogHeader()
               "Cats","HTF_OK","Notes");
   FileClose(h);
 }
+// --- Backward-compat overload: erlaubt alte 18-arg Calls (ohne cats) ---
+void LogRow(string ev,string mod,string dec,string mode,string dir,
+            double price,double sl,double tp,
+            double qL,double qS,double dL,double dS,
+            double aL,double aS,double qaL,double qaS,
+            bool htfok,string notes)
+{
+  // ruft die 19-Parameter-Version auf, cats=0
+  LogRow(ev,mod,dec,mode,dir,price,sl,tp,
+         qL,qS,dL,dS,aL,aS,qaL,qaS,
+         0,htfok,notes);
+}
+
 void LogRow(string ev,string mod,string dec,string mode,string dir,double price,double sl,double tp,
             double qL,double qS,double dL,double dS,double aL,double aS,double qaL,double qaS,
             int cats,bool htfok,string notes)
