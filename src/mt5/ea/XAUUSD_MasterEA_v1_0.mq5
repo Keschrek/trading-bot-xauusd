@@ -56,6 +56,9 @@ input int      InpStoch_Slow          = 3;
 input int      InpStoch_OB            = 80;
 input int      InpStoch_OS            = 20;
 
+// Money Flow Index (MFI)
+input int      InpMFI_Period          = 14;
+
 // CPR / VWAP / M15-Align / ATR-D1-Ref
 input bool     InpUseCPR              = true;
 input bool     InpUseVWAP             = true;
@@ -92,6 +95,7 @@ int      g_handleADX   = INVALID_HANDLE;
 int      g_handleSAR   = INVALID_HANDLE;
 int      g_handleCCI   = INVALID_HANDLE;
 int      g_handleSTO   = INVALID_HANDLE;
+int      g_handleMFI   = INVALID_HANDLE;
 
 datetime g_lastM1CloseTime = 0;
 int      g_digits = 2;
@@ -194,6 +198,13 @@ double GetPSAR()
   if(CopyBuffer(g_handleSAR,0,0,1,b)<1) return 0.0;
   return b[0];
 }
+// MFI
+double GetMFI()
+{
+  double b[]; ArraySetAsSeries(b,true);
+  if(CopyBuffer(g_handleMFI,0,0,1,b)<1) return 50.0;
+  return b[0];
+}
 
 // VWAP (Session ab DayResetHour)
 datetime SessionStart()
@@ -269,25 +280,41 @@ bool VolumeSpike()
 }
 bool StrengthOK_Basic()
 {
-  double atr=GetATR(); if(atr<=0 || !SymbolInfoTick(InpSymbol,g_tick)) return false;
+  double atr=GetATR(); 
+  if(atr<=0 || !SymbolInfoTick(InpSymbol,g_tick)) return false;
   return (atr/g_tick.bid > 0.0010);
 }
+
 bool StrengthOK_ADX()
 {
-  double adx=GetADX(); return (adx>=InpADX_Moderate);
+  double adx=GetADX(); 
+  return (adx>=InpADX_Moderate);
 }
+
+// grobe Relation M1-ATR zu D1-ATR (punkte-basiert)
 bool EnoughVolatilityDailyRef()
 {
-  // grobe Relation M1-ATR zu D1-ATR (punkte-basiert)
   int hD1 = iATR(InpSymbol,PERIOD_D1,14);
   if(hD1==INVALID_HANDLE) return true;
+
   double d1b[]; ArraySetAsSeries(d1b,true);
   if(CopyBuffer(hD1,0,0,1,d1b)<1){ IndicatorRelease(hD1); return true; }
-  double atrD1 = d1b[0]; IndicatorRelease(hD1);
+  double atrD1 = d1b[0];
+  IndicatorRelease(hD1);
+
   double atrM1 = GetATR();
   if(atrD1<=0 || atrM1<=0) return true;
+
   return ( (atrM1/atrD1) >= InpATR_M1_to_D1_MinRatio );
 }
+
+// **NEU separat (nicht in EnoughVolatilityDailyRef!)**
+bool StrengthOK_MFI()
+{
+  double mfi = GetMFI();
+  return (mfi>=60.0 || mfi<=40.0); // starker Kauf-/Verkaufsdruck
+}
+
 bool MomentumOK_Composite()
 {
   double macd = GetMACDHist();
@@ -346,7 +373,9 @@ void EvaluateMainFilter(bool &trend, bool &strength, bool &momentum, int &catsOu
   bool s2 = VolumeSpike();
   bool s3 = StrengthOK_ADX();
   bool s4 = EnoughVolatilityDailyRef();
-  strength = ( (s1||s2||s3) && s4 );
+  bool s5 = StrengthOK_MFI();
+  strength = ( (s1||s2||s3||s5) && s4 );
+
 
   // Momentum: MACD/RSI/CCI/Stoch Composite
   momentum = MomentumOK_Composite();
@@ -386,19 +415,30 @@ void ComputeQualityScore(double &longScore,double &shortScore, string &note)
 void ComputeDirectionScore(double &longScore,double &shortScore)
 {
   longScore=0; shortScore=0;
+
   // EMA 50/200 Bias
   if(EmaBiasOK_TF(InpTF_Work,50,200)) longScore+=1.0; else shortScore+=1.0;
+
   // EMA 5/10 slope (naiv via f0>f1)
   double f0=MaValue(InpTF_Work,5), f1=MaValue(InpTF_Work,5,MODE_EMA,PRICE_CLOSE,1);
   if(f0>f1) longScore+=0.5; else if(f0<f1) shortScore+=0.5;
+
   // MACD
   double macd=GetMACDHist(); if(macd>0) longScore+=1.0; if(macd<0) shortScore+=1.0;
+
   // RSI
   double rsi=GetRSI(InpTF_Work,14); if(rsi>50) longScore+=0.5; else if(rsi<50) shortScore+=0.5;
+
   // CCI
   double cci=GetCCI(); if(cci>+InpCCI_Threshold) longScore+=0.5; if(cci<-InpCCI_Threshold) shortScore+=0.5;
+
   // HTF Bias (H1 EMA50 Lage, Kerze [1]) als Gategewicht
   if(EmaBiasOK_TF(InpTF_HTF,50,200,1)) longScore+=0.5; else shortScore+=0.5;
+
+  // MFI (optional als Richtungsgewicht)
+  double mfi=GetMFI();
+  if(mfi>=60)      longScore+=0.5;
+  else if(mfi<=40) shortScore+=0.5;
 }
 
 void ApplyMetaAdjust(double &adjLong,double &adjShort){ adjLong=0.0; adjShort=0.0; } // externe KI-Adjust später
@@ -658,6 +698,7 @@ void OnInitCommon()
   g_handleSAR  = iSAR(InpSymbol, InpTF_Work, InpPSAR_Step, InpPSAR_Max);
   g_handleCCI  = iCCI(InpSymbol, InpTF_Work, InpCCI_Period, PRICE_TYPICAL);
   g_handleSTO  = iStochastic(InpSymbol, InpTF_Work, InpStoch_K, InpStoch_D, InpStoch_Slow, MODE_SMA, STO_LOWHIGH);
+  g_handleMFI  = iMFI(InpSymbol, InpTF_Work, InpMFI_Period, VOLUME_TICK);
 
   EnsureLogHeader();
 
@@ -677,10 +718,13 @@ int OnInit()
 {
   OnInitCommon();
   if(g_handleATR==INVALID_HANDLE || g_handleMACD==INVALID_HANDLE || g_handleADX==INVALID_HANDLE ||
-     g_handleSAR==INVALID_HANDLE || g_handleCCI==INVALID_HANDLE || g_handleSTO==INVALID_HANDLE)
+     g_handleSAR==INVALID_HANDLE || g_handleCCI==INVALID_HANDLE || g_handleSTO==INVALID_HANDLE ||
+     g_handleMFI==INVALID_HANDLE)
      return(INIT_FAILED);
+
   return(INIT_SUCCEEDED);
 }
+
 void OnDeinit(const int reason)
 {
   if(g_handleATR!=INVALID_HANDLE)  IndicatorRelease(g_handleATR);
@@ -689,7 +733,9 @@ void OnDeinit(const int reason)
   if(g_handleSAR!=INVALID_HANDLE)  IndicatorRelease(g_handleSAR);
   if(g_handleCCI!=INVALID_HANDLE)  IndicatorRelease(g_handleCCI);
   if(g_handleSTO!=INVALID_HANDLE)  IndicatorRelease(g_handleSTO);
+  if(g_handleMFI!=INVALID_HANDLE)  IndicatorRelease(g_handleMFI);
 }
+
 
 void OnTick()
 {
