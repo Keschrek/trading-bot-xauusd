@@ -355,12 +355,19 @@ ENUM_TIMEFRAMES tf = PERIOD_M5;
   if(bear) return -1;
   return 0;
 }
+// ---- Direction voting helper (global) ----
+void AddVote(int v, int &sum, int &lv, int &sv)
+{
+  if(v>0){ lv++; sum++; }
+  else if(v<0){ sv++; sum--; }
+}
 
 // ======= Main Filter & Scores =======
 void EvaluateMainFilter(bool &trend, bool &strength, bool &momentum, int &catsOut, bool &htfokOut, string &notes)
 {
   trend=false; strength=false; momentum=false; catsOut=0; htfokOut=false; notes="";
-  // Trend: EMA5/10 Cross oder EMA50/200 Bias oder PSAR-Richtung oder CPR-Breakout
+
+  // Trend: EMA5/10 Cross, EMA50/200 Bias, PSAR-Richtung, CPR-Breakout
   bool t1 = EmaCross_TF(InpTF_Work,5,10);
   bool t2 = EmaBiasOK_TF(InpTF_Work,50,200);
   int  cprS=0; double P,BC,TC; if(InpUseCPR) cprS = CPRSignal(P,BC,TC);
@@ -368,21 +375,24 @@ void EvaluateMainFilter(bool &trend, bool &strength, bool &momentum, int &catsOu
   bool t4 = (cprS!=0);
   trend = (t1 || t2 || t3 || t4);
 
-  // Stärke: ATR-Bewegung, Volumen-Spike, ADX
+  // Stärke (ohne Daily-ATR-Gate!):
   bool s1 = StrengthOK_Basic();
   bool s2 = VolumeSpike();
   bool s3 = StrengthOK_ADX();
-  bool s4 = EnoughVolatilityDailyRef();
   bool s5 = StrengthOK_MFI();
-  strength = ( (s1||s2||s3||s5) && s4 );
+  strength = (s1 || s2 || s3 || s5);
 
+  // Daily-ATR-Referenz nur als Hinweis
+  bool s4_volRef = EnoughVolatilityDailyRef();
+  if(!s4_volRef) notes += "VOLREF_LOW ";
 
-  // Momentum: MACD/RSI/CCI/Stoch Composite
+  // Momentum
   momentum = MomentumOK_Composite();
 
   catsOut = (int)trend + (int)strength + (int)momentum;
-  htfokOut= EmaBiasOK_TF(InpTF_HTF,50,200,1); // H1-Bias mit Kerze [1]
+  htfokOut= EmaBiasOK_TF(InpTF_HTF,50,200,1);
 }
+
 
 void ComputeQualityScore(double &longScore,double &shortScore, string &note)
 {
@@ -441,8 +451,50 @@ void ComputeQualityScore(double &longScore,double &shortScore, string &note)
   // M15 Align Bonus
   if(InpUseM15Align && EmaBiasOK_TF(PERIOD_M15,5,10,1)){ longScore+=0.5; note+="M15Align "; }
 }
+// Mehrheitsentscheid: 7 Stimmen (EMA50/200, EMA5/10-Slope, MACD, RSI, CCI, HTF-Bias H1[1], MFI)
+// +1 = Long, -1 = Short, 0 = neutral. sum = longVotes - shortVotes.
+void ComputeDirectionVotes(int &sum, int &longVotes, int &shortVotes)
+{
+  sum=0; longVotes=0; shortVotes=0;
 
+  // 1) EMA 50/200 Bias (M1)
+  AddVote( EmaBiasOK_TF(InpTF_Work,50,200) ? +1 : -1, sum,longVotes,shortVotes );
 
+  // 2) EMA 5/10 Slope (M1): f0>f1 => Long, f0<f1 => Short
+  double f0=MaValue(InpTF_Work,5), f1=MaValue(InpTF_Work,5,MODE_EMA,PRICE_CLOSE,1);
+  AddVote( (f0>f1)? +1 : (f0<f1? -1 : 0), sum,longVotes,shortVotes );
+
+  // 3) MACD-Hist (M1)
+  double macd = GetMACDHist();
+  AddVote( (macd>0)? +1 : (macd<0? -1 : 0), sum,longVotes,shortVotes );
+
+  // 4) RSI (M1)
+  double rsi  = GetRSI(InpTF_Work,14);
+  AddVote( (rsi>50)? +1 : (rsi<50? -1 : 0), sum,longVotes,shortVotes );
+
+  // 5) CCI (M1)
+  double cci = GetCCI();
+  AddVote( (cci>+InpCCI_Threshold)? +1 : (cci<-InpCCI_Threshold? -1 : 0), sum,longVotes,shortVotes );
+
+  // 6) HTF-Bias (H1, Kerze [1])
+  AddVote( EmaBiasOK_TF(InpTF_HTF,50,200,1) ? +1 : -1, sum,longVotes,shortVotes );
+
+  // 7) MFI (M1)
+  double mfi = GetMFI();
+  AddVote( (mfi>=60)? +1 : (mfi<=40? -1 : 0), sum,longVotes,shortVotes );
+}
+
+// Liefert Konsens-Bias und eine Dir-Stärke (für GateByScores).
+bool MajorityDecision(string &bias,double &dirStrength)
+{
+  int sum=0, lv=0, sv=0;
+  ComputeDirectionVotes(sum,lv,sv);
+  if(sum>=3){ bias="LONG";  dirStrength=(double)sum; return true; }
+  if(sum<=-3){ bias="SHORT"; dirStrength=(double)(-sum); return true; }
+  bias=""; dirStrength=0.0; return false; // kein klarer Konsens
+}
+
+// (optional, behältst du für Logging/Analyse; NICHT mehr für die Richtungs-Entscheidung nötig)
 void ComputeDirectionScore(double &longScore,double &shortScore)
 {
   longScore=0; shortScore=0;
@@ -463,7 +515,7 @@ void ComputeDirectionScore(double &longScore,double &shortScore)
   // CCI
   double cci=GetCCI(); if(cci>+InpCCI_Threshold) longScore+=0.5; if(cci<-InpCCI_Threshold) shortScore+=0.5;
 
-  // HTF Bias (H1 EMA50 Lage, Kerze [1]) als Gategewicht
+  // HTF Bias (H1 EMA50 Lage, Kerze [1]) als Zusatzgewicht
   if(EmaBiasOK_TF(InpTF_HTF,50,200,1)) longScore+=0.5; else shortScore+=0.5;
 
   // MFI (optional als Richtungsgewicht)
@@ -471,6 +523,7 @@ void ComputeDirectionScore(double &longScore,double &shortScore)
   if(mfi>=60)      longScore+=0.5;
   else if(mfi<=40) shortScore+=0.5;
 }
+
 
 void ApplyMetaAdjust(double &adjLong,double &adjShort){ adjLong=0.0; adjShort=0.0; } // externe KI-Adjust später
 
@@ -657,7 +710,7 @@ void TryEnter(string bias, double qL,double qS,double dL,double dS,double aL,dou
   }
 
   double atr = GetATR();
-  double slPts = MathMax((atr*InpATR_Mult_SL)/g_point, 100.0);
+  double slPts = (atr*InpATR_Mult_SL)/g_point;  // rein ATR-basiert (keine fixe Untergrenze)
   double baseLots = CalcLotByRisk(slPts);
   if(baseLots<=0){
     LogRow("ENTRY_BLOCK","EntryManager","BLOCK",ModeName(),bias,0,0,0,qL,qS,dL,dS,aL,aS,qaL,qaS,0,true,"lot calc failed");
@@ -800,20 +853,35 @@ void OnTick()
   if(!(cats>=2 && htfok))
   { LogRow("FILTER_BLOCK","MainFilter","BLOCK",ModeName(),"-",0,0,0,0,0,0,0,0,0,0,cats,htfok,"main filter "+nfNote); ManagePositions(); return; }
 
-  // Scores
-  double qL=0,qS=0,dL=0,dS=0; string qNote="";
-  ComputeQualityScore(qL,qS,qNote);
-  ComputeDirectionScore(dL,dS);
-  double aL=0,aS=0; ApplyMetaAdjust(aL,aS); aL=Clamp(aL,-InpAdjustMaxAbs,InpAdjustMaxAbs); aS=Clamp(aS,-InpAdjustMaxAbs,InpAdjustMaxAbs);
-  double qaL = qL + aL, qaS = qS + aS;
+// Scores
+double qL=0,qS=0; string qNote="";
+ComputeQualityScore(qL,qS,qNote);
 
-  // Entscheidung Long/Short
-  string note="";
-  bool gateLong  = GateByScores(qaL, dL, note);
-  bool gateShort = GateByScores(qaS, dS, note);
+double aL=0,aS=0; 
+ApplyMetaAdjust(aL,aS);
+aL=Clamp(aL,-InpAdjustMaxAbs,InpAdjustMaxAbs); 
+aS=Clamp(aS,-InpAdjustMaxAbs,InpAdjustMaxAbs);
+double qaL = qL + aL, qaS = qS + aS;
 
-  if(gateLong && dL>=1.0 && dL>=dS)        TryEnter("LONG",  qL,qS,dL,dS,aL,aS,qaL,qaS);
-  else if(gateShort && dS>=1.0 && dS>dL)   TryEnter("SHORT", qL,qS,dL,dS,aL,aS,qaL,qaS);
+// Richtung per Mehrheitsentscheid
+double dirStrength=0.0; 
+string bias="";
+bool hasMajority = MajorityDecision(bias, dirStrength);
+if(!hasMajority){
+  LogRow("DIR_BLOCK","Direction","BLOCK",ModeName(),"-",0,0,0, qL,qS,0,0,aL,aS,qaL,qaS, 0,true, "no majority");
+  ManagePositions();
+  return;
+}
+
+// Gate je Richtung mit dirStrength als Richtungsstärke
+string note="";
+if(bias=="LONG"){
+  bool ok = GateByScores(qaL, dirStrength, note);
+  if(ok) TryEnter("LONG",  qL,qS,dirStrength,0,aL,aS,qaL,qaS);
+}else if(bias=="SHORT"){
+  bool ok = GateByScores(qaS, dirStrength, note);
+  if(ok) TryEnter("SHORT", qL,qS,0,dirStrength,aL,aS,qaL,qaS);
+}
 
   // Offene Positionen managen (Trailing/PSAR)
   ManagePositions();
