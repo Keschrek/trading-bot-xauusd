@@ -751,21 +751,68 @@ void ManagePositions()
       }
     }
 
-    if(!InpUseSmartTrailing) continue;
-    double priceCur = (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)? g_tick.bid : g_tick.ask;
-    double profitEUR= PositionGetDouble(POSITION_PROFIT);
-    if(profitEUR < InpMinTrailStartEUR) continue;
+     if(!InpUseSmartTrailing) continue;
 
-    double atr=GetATR();
-    double trailPts=MathMax((atr*InpATR_Mult_Trail)/g_point, 50.0);
-    double oldSL=PositionGetDouble(POSITION_SL), newSL=oldSL;
+    // Aktueller Gewinn in EUR
+    double profitEUR = PositionGetDouble(POSITION_PROFIT);
+    if(profitEUR < InpMinTrailStartEUR) continue; // erst ab Mindestgewinn
 
-    if(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)
-      newSL=MathMax(oldSL, priceCur - trailPts*g_point);
-    else
-      newSL=MathMin(oldSL, priceCur + trailPts*g_point);
+    // Symbol- & Positionsdaten
+    long   ptype     = PositionGetInteger(POSITION_TYPE);
+    double lots      = PositionGetDouble(POSITION_VOLUME);
+    double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+    double oldSL     = PositionGetDouble(POSITION_SL);
 
-    if(newSL!=oldSL) Trade.PositionModify(t,newSL,PositionGetDouble(POSITION_TP));
+    // Aktueller Kurs (Bid für BUY, Ask für SELL)
+    double priceCur = (ptype==POSITION_TYPE_BUY ? g_tick.bid : g_tick.ask);
+
+    // Money-Koeffizient: EUR pro Preis-Einheit (nicht Punkte!) und pro Position
+    double tickValue = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_VALUE);   // EUR pro Tick (1 Lot)
+    double tickSize  = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);    // Preisgröße pro Tick
+    if(tickSize<=0 || tickValue<=0 || lots<=0) continue;
+    double moneyPerPriceForPos = (tickValue / tickSize) * lots; // EUR je 1.0 Preis für gesamte Position
+
+    // Neuer gewünschter SL-Gewinn = aktueller Gewinn - 2 EUR (nie negativ)
+    double newSL_Profit_EUR = profitEUR - 2.0;
+    if(newSL_Profit_EUR <= 0.0) continue;
+
+    // Wieviel Gewinn (EUR) entspricht dem bisherigen SL?
+    double oldSL_Profit_EUR = 0.0;
+    if(oldSL > 0.0)
+    {
+      if(ptype==POSITION_TYPE_BUY)
+        oldSL_Profit_EUR = (oldSL - openPrice) * moneyPerPriceForPos;
+      else
+        oldSL_Profit_EUR = (openPrice - oldSL) * moneyPerPriceForPos;
+    }
+    // Nur nachziehen, niemals zurücksetzen
+    if(newSL_Profit_EUR <= oldSL_Profit_EUR + 1e-8) continue;
+
+    // Ziel‑SL‑Preis berechnen, der genau newSL_Profit_EUR entspricht
+    double newSL = oldSL;
+    if(ptype==POSITION_TYPE_BUY)
+    {
+      // Gewinn = (SL - Open) * coeff  => SL = Open + Gewinn/coeff
+      newSL = openPrice + (newSL_Profit_EUR / moneyPerPriceForPos);
+
+      // Safety: SL muss unter aktuellem Preis liegen und über altem SL (nur vorwärts)
+      if(newSL >= priceCur) newSL = priceCur - 1.0 * g_point;
+      if(oldSL > 0.0) newSL = MathMax(newSL, oldSL + 0.0*g_point);
+    }
+    else // SELL
+    {
+      // Gewinn = (Open - SL) * coeff  => SL = Open - Gewinn/coeff
+      newSL = openPrice - (newSL_Profit_EUR / moneyPerPriceForPos);
+
+      // Safety: SL muss über aktuellem Preis liegen und unter altem SL (nur vorwärts)
+      if(newSL <= priceCur) newSL = priceCur + 1.0 * g_point;
+      if(oldSL > 0.0) newSL = MathMin(newSL, oldSL - 0.0*g_point);
+    }
+
+    // Anwenden falls echte Änderung
+    if(oldSL<=0.0 || MathAbs(newSL - oldSL) >= (0.1 * g_point))
+      Trade.PositionModify(t, newSL, PositionGetDouble(POSITION_TP));
+
   }
 }
 
