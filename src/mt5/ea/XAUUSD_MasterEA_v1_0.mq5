@@ -387,30 +387,61 @@ void EvaluateMainFilter(bool &trend, bool &strength, bool &momentum, int &catsOu
 void ComputeQualityScore(double &longScore,double &shortScore, string &note)
 {
   longScore=0; shortScore=0; note="";
+
   // EMA 5/10 Cross
   if(EmaCross_TF(InpTF_Work,5,10)){ longScore+=1.5; shortScore+=1.5; note+="EMA5/10 "; }
+
   // ADX
-  double adx=GetADX(); if(adx>=InpADX_Strong){ longScore+=1.0; shortScore+=1.0; note+="ADX_strong "; }
+  double adx=GetADX(); 
+  if(adx>=InpADX_Strong){ longScore+=1.0; shortScore+=1.0; note+="ADX_strong "; }
   else if(adx>=InpADX_Moderate){ longScore+=0.5; shortScore+=0.5; note+="ADX_mod "; }
+
   // Volumen
   if(VolumeSpike()){ longScore+=1.0; shortScore+=1.0; note+="VOL_spike "; }
+
   // Candlestick M5
-  int eng=M5_Engulf(); if(eng==+1){ longScore+=1.5; note+="BullEngulf "; } else if(eng==-1){ shortScore+=1.5; note+="BearEngulf "; }
+  int eng=M5_Engulf(); 
+  if(eng==+1){ longScore+=1.5; note+="BullEngulf "; } 
+  else if(eng==-1){ shortScore+=1.5; note+="BearEngulf "; }
+
   // RSI/CCI/MACD-Stütze
   double rsi=GetRSI(InpTF_Work,14); if(rsi>55) longScore+=0.5; if(rsi<45) shortScore+=0.5;
   double cci=GetCCI(); if(cci>InpCCI_Threshold) longScore+=0.5; if(cci<-InpCCI_Threshold) shortScore+=0.5;
   double macd=GetMACDHist(); if(macd>0) longScore+=0.5; if(macd<0) shortScore+=0.5;
-  // VWAP: Preis vs VWAP
-  double vwap; if(VWAP(vwap)){ if(SymbolInfoTick(InpSymbol,g_tick)){ if(g_tick.bid>vwap) longScore+=0.5; else shortScore+=0.5; note+="VWAP "; } }
-  // CPR: Breakout/Bounce
+
+  // **NEU: MFI-Beitrag**
+  double mfi = GetMFI();
+  if(mfi>=60) { longScore+=0.5; note+="MFI "; }
+  else if(mfi<=40) { shortScore+=0.5; note+="MFI "; }
+
+  // **NEU: PSAR Score-Bonus (+0.5)**
+  if(InpUsePSARExit){
+    if(PSAR_TrendUp())   { longScore+=0.5;  note+="PSAR "; }
+    if(PSAR_TrendDown()) { shortScore+=0.5; note+="PSAR "; }
+  }
+
+  // VWAP: Preis vs VWAP  (**mit Zahl im Note**)
+  double vwap; 
+  if(VWAP(vwap)){
+    if(SymbolInfoTick(InpSymbol,g_tick)){
+      if(g_tick.bid>vwap) longScore+=0.5; else shortScore+=0.5;
+      note+="VWAP="+DoubleToString(vwap,g_digits)+" ";
+    }
+  }
+
+  // CPR: Breakout/Bounce  (**mit Zahlen im Note**)
   double P,BC,TC; int cprs=CPRSignal(P,BC,TC);
   if(cprs==+1){ longScore+=1.0; note+="CPR_up "; }
   else if(cprs==-1){ shortScore+=1.0; note+="CPR_dn "; }
+  note+="CPR:P="+DoubleToString(P,g_digits)+" BC="+DoubleToString(BC,g_digits)+" TC="+DoubleToString(TC,g_digits)+" ";
+
   // Volatilitätsbonus via ATR
   double atr=GetATR(); if(atr>0){ longScore+=0.5; shortScore+=0.5; note+="ATR_bonus "; }
+
   // M15 Align Bonus
   if(InpUseM15Align && EmaBiasOK_TF(PERIOD_M15,5,10,1)){ longScore+=0.5; note+="M15Align "; }
 }
+
 
 void ComputeDirectionScore(double &longScore,double &shortScore)
 {
