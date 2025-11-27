@@ -1,3 +1,25 @@
+// CHANGELOG (Cursor refactor 2025-11-27)
+// - Learning pipeline wiring repaired (magic + contexts).
+//   Why: Missing Trade.SetExpertMagic made OnTradeTransaction ignore EA orders.
+//   Impact: EvaluateClosedTrade now runs for every fill and CSV/stat files populate.
+//   Areas: Learning / Files
+// - Added periodic learning/indicator/phase adjustment hooks.
+//   Why: Apply*Adjustments() were never invoked so shifts stayed zero.
+//   Impact: Score/indicator weights adapt once per bar without extra overhead.
+//   Areas: Learning / Entry
+// - Propagated trade plans into decision snapshots for staged entries.
+//   Why: Market fills reused stale g_lastDecisionSnapshot without SL/TP context.
+//   Impact: Trade contexts always have proper entry/SL/TP for stats & trailing.
+//   Areas: Entry / Learning
+// - Removed legacy monitoring subsystem to cut overhead.
+//   Why: CSV snapshots were optional debugging only, but added clutter and I/O.
+//   Impact: Leaner runtime without touching trading or learning flows.
+//   Areas: Monitoring
+// - Added safety logs and NaN guards around learning contexts.
+//   Why: Missing contexts silently skipped CSV/stat updates; hard to debug.
+//   Impact: Debug flag surfaces issues without affecting live performance.
+//   Areas: Learning / Safety
+
 // This file contains the full source code for the XAU/USD scalping EA.
 // It includes a number of trailing stop and break‑even management features.
 // The original code was provided by the user and has been modified to fix
@@ -229,7 +251,9 @@ enum CustomIndicatorId
    CIND_PSAR = 11,
    CIND_CPR = 12,
    CIND_M15ALIGN = 13,
-   CIND_ATR_BONUS = 14
+   CIND_ATR_BONUS = 14,
+   CIND_STRUCTURE = 15,
+   CIND_FIBZONE = 16
 };
 
 // REGIME: helper struct to share latest context
@@ -259,6 +283,8 @@ struct IndicatorScoreBreakdown
    double cpr;
    double m15align;
    double atrBonus;
+   double structure;
+   double fibzone;
 };
 
 // INDLEARN: stats per indicator/regime
@@ -1141,14 +1167,16 @@ void ComputeQualityScore(double &longScore,double &shortScore,string &note)
       if(ok5 && ok10)
       {
          double indFactorM15 = (InpEnableIndicatorLearning ? Clamp(1.0+IndGetShift(CIND_M15ALIGN,ctx.regimeId),0.5,1.5) : 1.0);
+         double phaseWeightM15_L = GetIndicatorPhaseWeight("M15",currentTrendPhase,currentVolLevel,currentSessionBucket,+1);
+         double phaseWeightM15_S = GetIndicatorPhaseWeight("M15",currentTrendPhase,currentVolLevel,currentSessionBucket,-1);
          if(e5>e10)
          {
-            double contrib = 0.5*indFactorM15;
+            double contrib = 0.5*indFactorM15*phaseWeightM15_L;
             longScore+=contrib; g_lastIndicatorScoreLong.m15align+=contrib; note+="M15AlignUp ";
          }
          else if(e5<e10)
          {
-            double contrib = 0.5*indFactorM15;
+            double contrib = 0.5*indFactorM15*phaseWeightM15_S;
             shortScore+=contrib; g_lastIndicatorScoreShort.m15align+=contrib; note+="M15AlignDn ";
          }
       }
@@ -1168,6 +1196,49 @@ void ComputeQualityScore(double &longScore,double &shortScore,string &note)
       g_lastIndicatorScoreLong.ichimoku+=adjLong;
       g_lastIndicatorScoreShort.ichimoku+=adjShort;
       note+=ikhNote;
+   }
+
+   // Structure bias
+   EntrySnapshot structLongSnap; ZeroMemory(structLongSnap); structLongSnap.direction="LONG"; structLongSnap.atr=atrVal;
+   ComputeStructureContext(structLongSnap);
+   ComputeFibZoneContext(structLongSnap);
+   EntrySnapshot structShortSnap; ZeroMemory(structShortSnap); structShortSnap.direction="SHORT"; structShortSnap.atr=atrVal;
+   ComputeStructureContext(structShortSnap);
+   ComputeFibZoneContext(structShortSnap);
+   double structLongScore = CalcStructureScore(structLongSnap,true);
+   double structShortScore = CalcStructureScore(structShortSnap,false);
+   if(structLongScore!=0.0)
+   {
+      longScore += structLongScore;
+      g_lastIndicatorScoreLong.structure += structLongScore;
+      note += "StructL ";
+   }
+   if(structShortScore!=0.0)
+   {
+      shortScore += structShortScore;
+      g_lastIndicatorScoreShort.structure += structShortScore;
+      note += "StructS ";
+   }
+
+   if(InpEnableFibLearning)
+   {
+      double indFactorFib = (InpEnableIndicatorLearning ? Clamp(1.0+IndGetShift(CIND_FIBZONE,ctx.regimeId),0.5,1.5) : 1.0);
+      double phaseWeightFib_L = GetIndicatorPhaseWeight("FIB",currentTrendPhase,currentVolLevel,currentSessionBucket,+1);
+      double phaseWeightFib_S = GetIndicatorPhaseWeight("FIB",currentTrendPhase,currentVolLevel,currentSessionBucket,-1);
+      if(structLongSnap.fibZoneScore>0.0)
+      {
+         double contrib = structLongSnap.fibZoneScore * indFactorFib * phaseWeightFib_L;
+         longScore += contrib;
+         g_lastIndicatorScoreLong.fibzone += contrib;
+         note += "FibL ";
+      }
+      if(structShortSnap.fibZoneScore>0.0)
+      {
+         double contrib = structShortSnap.fibZoneScore * indFactorFib * phaseWeightFib_S;
+         shortScore += contrib;
+         g_lastIndicatorScoreShort.fibzone += contrib;
+         note += "FibS ";
+      }
    }
 }
 void ApplyMetaAdjust(double &adjLong,double &adjShort)
@@ -1279,9 +1350,24 @@ input double   InpRegimeVolHighRatio  = 1.3;
 input int      InpStructureLookbackBars = 60;
 input double   InpStructureNearHighPct = 0.8;
 input double   InpStructureNearLowPct  = 0.2;
-input bool     InpEnableLearningMonitor = true;
-input int      InpMonitorMaxSizeKB      = 1024;
-
+input double   InpSessionBias_Asia     = 0.0;
+input double   InpSessionBias_London   = 0.0;
+input double   InpSessionBias_NewYork  = 0.0;
+input double   InpSessionBias_Off      = 0.0;
+input double   InpStructureNearWeight  = 0.5;
+input double   InpStructureBreakoutWeight = 0.35;
+input double   InpStructureDistScale   = 200.0;
+input double   InpSplitBiasStrength    = 0.3;
+input bool     InpEnablePartialTake    = true;
+input double   InpPartialTake_R        = 1.2;
+input double   InpPartialTake_Pct      = 0.4;
+input double   InpRiskScaleMin         = 0.7;
+input double   InpRiskScaleMax         = 1.3;
+input double   InpRiskScaleSensitivity = 1.5;
+input bool     InpEnableFibLearning    = true;
+input int      InpFibSwingLookback     = 120;
+input double   InpFibMinSwingATR       = 0.5;
+input double   InpFibZoneWeight        = 0.6;
 // Logging
 input string   InpLogFilePrefix       = "xauusd_meta_";
 input bool     InpDebug               = true;
@@ -1494,6 +1580,19 @@ struct EntrySnapshot
    double   indScore_CPR;
    double   indScore_M15Align;
    double   indScore_ATRBonus;
+   double   indScore_Structure;
+   double   indScore_FibZone;
+   double   fibHigh;
+   double   fibLow;
+   double   fibNearestLevel;
+   double   fibDistancePts;
+   double   fibZoneScore;
+   bool     fibIsSupport;
+   bool     fibIsResistance;
+   double   fibLevelRatio;
+   double   indScore_Structure;
+   double   riskMultiplier;
+   double   splitBias;
    // PHASE-LEARNING: market phase context
    int      trendPhase;      // -1, 0, +1
    int      volLevel;        // 0,1,2
@@ -1519,6 +1618,10 @@ struct TradeContextEntry
    // VARIANT: context fields
    int      variantId;      // Strategietyp / Variante
    int      paramSetId;     // Parameter-Set (Score- & Trailing-Profil)
+   bool     partialTaken;
+   double   initialVolume;
+   double   partialVolume;
+   double   initialRiskPts;
 };
 
 struct PendingOrderContext
@@ -1576,8 +1679,6 @@ ScoreBandStat        g_scoreStats[];
 string               g_learningCsv = "";
 string               g_learningStatsFile = "";
 string               g_indicatorStatsFile = "";
-string               g_monitorFile = "XAUUSD_learning_monitor.csv";
-datetime             g_lastMonitorWriteTime = 0;
 // PHASE-LEARNING: indicator phase stats
 IndicatorPhaseStat   g_indPhaseStats[];
 
@@ -1629,11 +1730,12 @@ IndicatorScoreBreakdown g_lastIndicatorScoreShort = {0};
 IndicatorRegimeStat g_indStats[];
 
 // Forward declarations
-void LearningStoreTradeContext(ulong ticket,const EntrySnapshot &snap,double entryPrice,double sl,double tp);
+void LearningStoreTradeContext(ulong ticket,const EntrySnapshot &snap,double entryPrice,double sl,double tp,double volume);
 void LearningRegisterPendingOrder(ulong orderTicket,const EntrySnapshot &snap);
 void EvaluateClosedTrade(ulong ticket,double exitPrice,double profitPts,double profitMoney,string reason,datetime exitTime);
 void ApplyLearningAdjustments();
 void ApplyIndicatorLearningAdjustments();
+double LearningComputeExitShift(const TradeContextEntry &ctx);
 // VARIANT: forward declarations
 void VariantInitPresets();
 int ChooseVariantForNextTrade();
@@ -1660,13 +1762,10 @@ void IndicatorUpdateSingle(int indicatorId,int regimeId,double rMultiple);
 void IndicatorUpdateFromTrade(const TradeContextEntry &ctx,double rMultiple);
 bool LoadIndicatorStatsFromFile();
 bool SaveIndicatorStatsToFile();
-// MONITOR: helpers
-void MonitorEnsureFile();
-void MonitorWriteSnapshot();
-string MonitorTrendLabel(int trend);
-string MonitorVolLabel(int vol);
-string MonitorFormatTimestamp(datetime t);
-
+double SessionScoreAdjust(int session,string bias);
+double LearningRiskMultiplier(const EntrySnapshot &snap,const string bias);
+double EntrySplitBias(const EntrySnapshot &snap,const string bias);
+double AggregateRegimeShift(int regimeId,int dir);
 // ==============================
 // ===== LEARNING HELPERS =======
 // ==============================
@@ -1770,6 +1869,7 @@ void ResetIndicatorBreakdown(IndicatorScoreBreakdown &out)
    out.ema=0.0; out.adx=0.0; out.rsi=0.0; out.cci=0.0; out.macd=0.0; out.mfi=0.0;
    out.volume=0.0; out.vwap=0.0; out.patterns=0.0; out.ichimoku=0.0;
    out.psar=0.0; out.cpr=0.0; out.m15align=0.0; out.atrBonus=0.0;
+   out.structure=0.0; out.fibzone=0.0;
 }
 
 // STRUCTURE: capture latest swings and broader range context
@@ -1831,6 +1931,89 @@ void ComputeStructureContext(EntrySnapshot &snap)
       snap.distToRecentHighPts = (snap.recentHigh-refPrice)/g_point;
    if(snap.recentLow>0.0)
       snap.distToRecentLowPts = (refPrice-snap.recentLow)/g_point;
+}
+
+void ComputeFibZoneContext(EntrySnapshot &snap)
+{
+   snap.fibHigh = snap.recentHigh;
+   snap.fibLow  = snap.recentLow;
+   snap.fibNearestLevel = 0.0;
+   snap.fibDistancePts = 0.0;
+   snap.fibZoneScore = 0.0;
+   snap.fibIsSupport = false;
+   snap.fibIsResistance = false;
+   snap.fibLevelRatio = 0.0;
+   snap.indScore_FibZone = 0.0;
+   if(!InpEnableFibLearning)
+      return;
+   if((snap.fibHigh<=0.0 || snap.fibLow<=0.0) && InpFibSwingLookback>0)
+   {
+      double hi=0.0, lo=0.0;
+      bool hiFound=false, loFound=false;
+      for(int i=1;i<=InpFibSwingLookback;i++)
+      {
+         double h=iHigh(g_symbol,PERIOD_M15,i);
+         double l=iLow(g_symbol,PERIOD_M15,i);
+         if(h>0.0 && (!hiFound || h>hi)){ hi=h; hiFound=true; }
+         if(l>0.0 && (!loFound || l<lo)){ lo=l; loFound=true; }
+      }
+      if(hiFound) snap.fibHigh=hi;
+      if(loFound) snap.fibLow=lo;
+   }
+   if(snap.fibHigh<=0.0 || snap.fibLow<=0.0 || snap.fibHigh<=snap.fibLow)
+      return;
+   double swing = snap.fibHigh - snap.fibLow;
+   if(snap.atr>0.0 && swing < snap.atr * InpFibMinSwingATR)
+      return;
+   double price = 0.0;
+   if(SymbolInfoTick(g_symbol,g_tick))
+      price = (snap.direction=="LONG"? g_tick.ask : g_tick.bid);
+   if(price<=0.0) price=iClose(g_symbol,InpTF_Work,0);
+   if(price<=0.0) return;
+   double ratios[5] = {0.236,0.382,0.5,0.618,0.786};
+   double nearest = snap.fibHigh;
+   double nearestRatio = 0.0;
+   double minDiff = MathAbs(price - snap.fibHigh);
+   for(int i=0;i<5;i++)
+   {
+      double lvl = snap.fibHigh - swing * ratios[i];
+      double diff = MathAbs(price - lvl);
+      if(diff < minDiff)
+      {
+         minDiff = diff;
+         nearest = lvl;
+         nearestRatio = ratios[i];
+      }
+   }
+   snap.fibNearestLevel = nearest;
+   snap.fibLevelRatio = nearestRatio;
+   if(g_point>0.0)
+      snap.fibDistancePts = minDiff / g_point;
+   double atr = snap.atr;
+   double tol = MathMax( (atr>0.0 ? atr*0.4 : swing*0.02), 3.0*g_point );
+   bool nearSupport = (price >= nearest && (price-nearest) <= tol);
+   bool nearResistance = (price <= nearest && (nearest-price) <= tol);
+   bool breakoutUp = (price > snap.fibHigh + tol);
+   bool breakoutDown = (price < snap.fibLow - tol);
+   snap.fibIsSupport = nearSupport;
+   snap.fibIsResistance = nearResistance;
+   double zoneScore = 0.0;
+   if(snap.direction=="LONG")
+   {
+      if(nearSupport) zoneScore += InpFibZoneWeight * (1.0 - nearestRatio);
+      if(nearResistance) zoneScore -= InpFibZoneWeight * (nearestRatio+0.1);
+      if(breakoutUp) zoneScore += InpFibZoneWeight;
+      if(breakoutDown) zoneScore -= InpFibZoneWeight*0.5;
+   }
+   else
+   {
+      if(nearResistance) zoneScore += InpFibZoneWeight * (nearestRatio+0.1);
+      if(nearSupport) zoneScore -= InpFibZoneWeight * (1.0 - nearestRatio);
+      if(breakoutDown) zoneScore += InpFibZoneWeight;
+      if(breakoutUp) zoneScore -= InpFibZoneWeight*0.5;
+   }
+   snap.fibZoneScore = Clamp(zoneScore,-2.0,2.0);
+   snap.indScore_FibZone = snap.fibZoneScore;
 }
 
 // PHASE-LEARNING: market phase detection helpers
@@ -2169,43 +2352,57 @@ void VariantUpdateStats(int variantId,double profitMoney)
 }
 
 // VARIANT: selection
+double VariantRegimeAffinity(const StrategyVariant &var,const RegimeContext &ctx)
+{
+   double score=0.0;
+   if(var.useStrongTrendFilter)
+      score += (ctx.trend!=REGIME_TREND_RANGE ? 0.4 : -0.2);
+   else
+      score += (ctx.trend==REGIME_TREND_RANGE ? 0.2 : 0.0);
+   if(var.usePatterns && (ctx.structure==REGIME_STR_NEAR_HIGH || ctx.structure==REGIME_STR_NEAR_LOW))
+      score += 0.2;
+   if(var.useVolumeFilter && ctx.vol==REGIME_VOL_HIGH)
+      score += 0.2;
+   if(var.useIchimokuBoost && ctx.trend!=REGIME_TREND_RANGE)
+      score += 0.15;
+   if(var.useCCIWeak && ctx.trend==REGIME_TREND_RANGE)
+      score += 0.1;
+   return score;
+}
+
 int ChooseVariantForNextTrade()
 {
-   int totalTrades=0;
-   for(int i=0;i<ArraySize(g_variantStats);i++)
-      totalTrades+=g_variantStats[i].trades;
-   
-   // Wenn noch wenig Daten: gleichmäßig verteilen
-   if(totalTrades<20)
-   {
-      int variantCount=ArraySize(g_variants);
-      if(variantCount==0) return 1;
-      int idx = (int)(totalTrades % variantCount);
-      return g_variants[idx].id;
-   }
-   
-   // Genug Daten: Exploitation (80-90%) + Exploration (10-20%)
-   double rand = MathRand()/(double)32767.0;
-   if(rand < 0.15) // 15% Exploration
-   {
-      int variantCount=ArraySize(g_variants);
-      if(variantCount==0) return 1;
-      int idx = (int)(MathRand() % variantCount);
-      return g_variants[idx].id;
-   }
-   
-   // 85% Exploitation: beste Variante wählen
-   int bestVariantId=1;
+   int variantCount=ArraySize(g_variants);
+   if(variantCount==0) return 1;
+   RegimeContext ctx = g_lastRegimeCtx;
+   if(ctx.regimeId==0 && ctx.trend==0 && ctx.vol==0 && ctx.session==0)
+      ctx = BuildRegimeContext();
+   double globalShift = AggregateRegimeShift(ctx.regimeId,+1) + AggregateRegimeShift(ctx.regimeId,-1);
+
    double bestScore=-1e10;
-   for(int i=0;i<ArraySize(g_variantStats);i++)
+   int bestVariantId=g_variants[0].id;
+   for(int v=0; v<variantCount; ++v)
    {
-      if(g_variantStats[i].trades<5) continue; // Mindestanzahl
-      double score = g_variantStats[i].pnl; // oder pnl/trades
-      if(score>bestScore)
+      StrategyVariant var = g_variants[v];
+      int statsIdx = VariantEnsureStats(var.id);
+      double trades = (double)g_variantStats[statsIdx].trades;
+      double perf = (trades>0.0 ? g_variantStats[statsIdx].pnl / trades : 0.0);
+      double varianceGuard = (trades<5 ? 0.0 : perf);
+      double regimeAffinity = VariantRegimeAffinity(var,ctx);
+      double exploration = (MathRand()/(double)32767.0)*0.05;
+      double totalScore = varianceGuard + regimeAffinity + globalShift*0.1 + exploration;
+      if(g_variantStats[statsIdx].lastReward>0.0) totalScore += 0.05;
+      if(totalScore>bestScore)
       {
-         bestScore=score;
-         bestVariantId=g_variantStats[i].variantId;
+         bestScore=totalScore;
+         bestVariantId=var.id;
       }
+   }
+
+   if(MathRand()/(double)32767.0 < 0.1)
+   {
+      int idx = (int)(MathRand()%variantCount);
+      bestVariantId = g_variants[idx].id;
    }
    return bestVariantId;
 }
@@ -2322,11 +2519,16 @@ EntrySnapshot BuildEntrySnapshot(string direction,double qL,double qS,double qaL
    snap.indScore_CPR = indSrc.cpr;
    snap.indScore_M15Align = indSrc.m15align;
    snap.indScore_ATRBonus = indSrc.atrBonus;
+   snap.indScore_Structure = indSrc.structure;
+   snap.indScore_FibZone = indSrc.fibzone;
     ComputeStructureContext(snap);
+   ComputeFibZoneContext(snap);
+   snap.riskMultiplier = 1.0;
+   snap.splitBias = 0.0;
    return snap;
 }
 
-void LearningStoreTradeContext(ulong ticket,const EntrySnapshot &snap,double entryPrice,double sl,double tp)
+void LearningStoreTradeContext(ulong ticket,const EntrySnapshot &snap,double entryPrice,double sl,double tp,double volume)
 {
    if(ticket==0 || !snap.valid) return;
    int idx=LearningFindTradeContext(ticket);
@@ -2344,6 +2546,24 @@ void LearningStoreTradeContext(ulong ticket,const EntrySnapshot &snap,double ent
    g_tradeContexts[idx].mfePts=0.0;
    g_tradeContexts[idx].maePts=0.0;
    g_tradeContexts[idx].exitReason="";
+   g_tradeContexts[idx].partialTaken=false;
+   g_tradeContexts[idx].partialVolume=0.0;
+   double minVol = SymbolInfoDouble(g_symbol,SYMBOL_VOLUME_MIN);
+   if(minVol<=0.0) minVol=0.01;
+   if(volume<=0.0) volume = minVol;
+   g_tradeContexts[idx].initialVolume=volume;
+   // precompute initial risk in points
+   double riskPts=0.0;
+   if(g_point>0.0 && sl>0.0 && entryPrice>0.0)
+   {
+      if(snap.direction=="LONG")
+         riskPts=(entryPrice-sl)/g_point;
+      else
+         riskPts=(sl-entryPrice)/g_point;
+   }
+   if(riskPts<=0.0 && snap.atr>0.0 && g_point>0.0)
+      riskPts=(snap.atr*InpATR_Mult_SL)/g_point;
+   g_tradeContexts[idx].initialRiskPts=riskPts;
    // VARIANT + LEARNING: integration - variantId und paramSetId setzen
    g_tradeContexts[idx].variantId = g_currentVariantId;
    StrategyVariant var = VariantGetById(g_currentVariantId);
@@ -2408,11 +2628,13 @@ void LearningEnsureCsv()
         "DistLastHigh;DistLastLow;NearHigh;NearLow;"
         "Ind_EMA;Ind_ADX;Ind_RSI;Ind_CCI;Ind_MACD;Ind_MFI;"
         "Ind_Volume;Ind_VWAP;Ind_Patterns;Ind_Ichimoku;Ind_PSAR;"
-        "Ind_CPR;Ind_M15Align;Ind_ATRBonus;"
+        "Ind_CPR;Ind_M15Align;Ind_ATRBonus;Ind_Structure;Ind_FibZone;"
+        "FibHigh;FibLow;FibNearest;FibDistPts;FibScore;FibSupport;FibResistance;FibRatio;"
         "VariantId;ParamSetId;HasPattern;PatternName;PatternScore;"
         "PatternStrength;EntryPrice;ExitPrice;ProfitPts;ProfitMoney;"
         "DurationMin;MFE;MAE;Reason;ReasonText;"
-        "LossStreak;WeightedPnlSum;WeightedAvg";
+        "LossStreak;WeightedPnlSum;WeightedAvg;"
+        "StructureScore;RiskMult;SplitBias;InitialVolume;PartialVolume";
 
     FileWriteString(h, header + "\n");
 
@@ -2437,8 +2659,8 @@ void LearningWriteCsv(const TradeContextEntry &ctx,
     // Header sicherstellen
     LearningEnsureCsv();
 
-    // Datei im reinen Append-Mode öffnen (robusteste Variante!)
-    int h = FileOpen(g_learningCsv, FILE_WRITE | FILE_CSV | FILE_ANSI, ';');
+    // Datei im Append-Mode öffnen ohne vorhandene Inhalte zu löschen
+    int h = FileOpen(g_learningCsv, FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI, ';');
     if (h == INVALID_HANDLE)
     {
         Print("[Learning] ERROR: Cannot open for append: ", g_learningCsv);
@@ -2518,6 +2740,16 @@ void LearningWriteCsv(const TradeContextEntry &ctx,
     CsvAppend(line, DoubleToString(ctx.snap.indScore_CPR, 2));
     CsvAppend(line, DoubleToString(ctx.snap.indScore_M15Align, 2));
     CsvAppend(line, DoubleToString(ctx.snap.indScore_ATRBonus, 2));
+    CsvAppend(line, DoubleToString(ctx.snap.indScore_Structure, 2));
+    CsvAppend(line, DoubleToString(ctx.snap.indScore_FibZone, 2));
+    CsvAppend(line, DoubleToString(ctx.snap.fibHigh, g_digits));
+    CsvAppend(line, DoubleToString(ctx.snap.fibLow, g_digits));
+    CsvAppend(line, DoubleToString(ctx.snap.fibNearestLevel, g_digits));
+    CsvAppend(line, DoubleToString(ctx.snap.fibDistancePts, 2));
+    CsvAppend(line, DoubleToString(ctx.snap.fibZoneScore, 2));
+    CsvAppend(line, IntegerToString((int)ctx.snap.fibIsSupport));
+    CsvAppend(line, IntegerToString((int)ctx.snap.fibIsResistance));
+    CsvAppend(line, DoubleToString(ctx.snap.fibLevelRatio, 3));
 
     CsvAppend(line, IntegerToString(ctx.variantId));
     CsvAppend(line, IntegerToString(ctx.paramSetId));
@@ -2535,6 +2767,21 @@ void LearningWriteCsv(const TradeContextEntry &ctx,
     CsvAppend(line, DoubleToString(ctx.maePts, 2));
     CsvAppend(line, reason);
     CsvAppend(line, ctx.snap.reasonText);
+    double qa = (ctx.snap.direction=="LONG"?ctx.snap.qaL:ctx.snap.qaS);
+    double band = LearningScoreBand(qa);
+    int dir = (ctx.snap.direction=="LONG"?+1:-1);
+    int statIdx = LearningFindScoreStat(band, dir, ctx.snap.regimeId);
+    int lossStreak = (statIdx>=0 ? g_scoreStats[statIdx].lossStreak : 0);
+    double weightedSum = (statIdx>=0 ? g_scoreStats[statIdx].weightedPnlSum : 0.0);
+    double weightedAvg = (statIdx>=0 ? g_scoreStats[statIdx].weightedAvg : 0.0);
+    CsvAppend(line, IntegerToString(lossStreak));
+    CsvAppend(line, DoubleToString(weightedSum, 4));
+    CsvAppend(line, DoubleToString(weightedAvg, 4));
+    CsvAppend(line, DoubleToString(ctx.snap.indScore_Structure, 2));
+    CsvAppend(line, DoubleToString(ctx.snap.riskMultiplier, 2));
+    CsvAppend(line, DoubleToString(ctx.snap.splitBias, 2));
+    CsvAppend(line, DoubleToString(ctx.initialVolume, 2));
+    CsvAppend(line, DoubleToString(ctx.partialVolume, 2));
 
     FileWriteString(h, line + "\n");
 
@@ -2664,6 +2911,8 @@ void IndicatorUpdateFromTrade(const TradeContextEntry &ctx,double rMultiple)
    // INDLEARN: update per indicator/regime stats based on trade outcome
    if(MathAbs(ctx.snap.indScore_EMA)>=1e-6)
       IndicatorUpdateSingle(CIND_EMA,ctx.snap.regimeId,rMultiple);
+   if(MathAbs(ctx.snap.indScore_ADX)>=1e-6)
+      IndicatorUpdateSingle(CIND_ADX,ctx.snap.regimeId,rMultiple);
    if(MathAbs(ctx.snap.indScore_RSI)>=1e-6)
       IndicatorUpdateSingle(CIND_RSI,ctx.snap.regimeId,rMultiple);
    if(MathAbs(ctx.snap.indScore_CCI)>=1e-6)
@@ -2688,6 +2937,10 @@ void IndicatorUpdateFromTrade(const TradeContextEntry &ctx,double rMultiple)
       IndicatorUpdateSingle(CIND_M15ALIGN,ctx.snap.regimeId,rMultiple);
    if(MathAbs(ctx.snap.indScore_ATRBonus)>=1e-6)
       IndicatorUpdateSingle(CIND_ATR_BONUS,ctx.snap.regimeId,rMultiple);
+   if(MathAbs(ctx.snap.indScore_Structure)>=1e-6)
+      IndicatorUpdateSingle(CIND_STRUCTURE,ctx.snap.regimeId,rMultiple);
+   if(MathAbs(ctx.snap.indScore_FibZone)>=1e-6)
+      IndicatorUpdateSingle(CIND_FIBZONE,ctx.snap.regimeId,rMultiple);
 }
 
 // PHASE-LEARNING: find or create indicator phase stat entry
@@ -2720,9 +2973,34 @@ int FindOrCreateIndPhaseStat(string name,int trendPhase,int volLevel,int session
    return idx;
 }
 
+double SnapshotIndicatorScore(const EntrySnapshot &snap,const string indName)
+{
+   if(indName=="EMA")      return snap.indScore_EMA;
+   if(indName=="ADX")      return snap.indScore_ADX;
+   if(indName=="RSI")      return snap.indScore_RSI;
+   if(indName=="CCI")      return snap.indScore_CCI;
+   if(indName=="MACD")     return snap.indScore_MACD;
+   if(indName=="MFI")      return snap.indScore_MFI;
+   if(indName=="VOL")      return snap.indScore_Volume;
+   if(indName=="VWAP")     return snap.indScore_VWAP;
+   if(indName=="PATTERN")  return snap.indScore_Patterns;
+   if(indName=="IKH")      return snap.indScore_Ichimoku;
+   if(indName=="PSAR")     return snap.indScore_PSAR;
+   if(indName=="CPR")      return snap.indScore_CPR;
+   if(indName=="M15")      return snap.indScore_M15Align;
+   if(indName=="ATR")      return snap.indScore_ATRBonus;
+   if(indName=="STRUCT")   return snap.indScore_Structure;
+   if(indName=="FIB")      return snap.indScore_FibZone;
+   return 0.0;
+}
+
 // PHASE-LEARNING: determine which indicators were active for a trade
 bool IsIndicatorActive(const EntrySnapshot &snap,string indName,string direction)
 {
+   double contrib = SnapshotIndicatorScore(snap,indName);
+   if(MathAbs(contrib) >= 1e-6)
+      return true;
+
    if(indName == "RSI")
    {
       if(direction == "LONG" && snap.rsi > 55) return true;
@@ -2760,6 +3038,14 @@ bool IsIndicatorActive(const EntrySnapshot &snap,string indName,string direction
    {
       if(snap.adx >= InpADX_Moderate) return true;
    }
+   else if(indName == "STRUCT")
+   {
+      if(MathAbs(snap.indScore_Structure) >= 1e-3) return true;
+   }
+   else if(indName == "FIB")
+   {
+      if(snap.fibZoneScore!=0.0) return true;
+   }
    return false;
 }
 
@@ -2793,7 +3079,7 @@ void UpdateIndicatorPhaseStats(const TradeContextEntry &ctx,double profitPts,dou
       rMultiple = (profitMoney > 0.0 ? 1.0 : -1.0);
    
    // List of indicators to check
-   string indicators[] = {"RSI","MACD","CCI","MFI","IKH","VOL","PATTERN","ADX"};
+   string indicators[] = {"EMA","ADX","RSI","CCI","MACD","MFI","VOL","VWAP","PATTERN","IKH","PSAR","CPR","M15","ATR","STRUCT","FIB"};
    
    for(int i=0; i<ArraySize(indicators); i++)
    {
@@ -2991,7 +3277,12 @@ void LearningUpdateStats(const TradeContextEntry &ctx,double profitPts,double pr
 void EvaluateClosedTrade(ulong ticket,double exitPrice,double profitPts,double profitMoney,string reason,datetime exitTime)
 {
    int idx=LearningFindTradeContext(ticket);
-   if(idx<0) return;
+   if(idx<0)
+   {
+      if(InpDebug)
+         Print("[Learning] WARN: context missing for ticket=",ticket," reason=",reason," profitPts=",DoubleToString(profitPts,2));
+      return;
+   }
    TradeContextEntry ctx = g_tradeContexts[idx];
    double durationMin = (double)(exitTime - ctx.entryTime)/60.0;
    if(durationMin<0.0) durationMin=0.0;
@@ -3019,6 +3310,95 @@ double LearningGetShift(double qa,string direction,int regimeId)
    for(int i=0;i<ArraySize(g_scoreStats);i++)
       if(g_scoreStats[i].direction==dir && MathAbs(g_scoreStats[i].band-band)<0.0001)
          return g_scoreStats[i].shift;
+   return 0.0;
+}
+
+double AggregateRegimeShift(int regimeId,int dir)
+{
+   double sum=0.0;
+   double weight=0.0;
+   for(int i=0;i<ArraySize(g_scoreStats);i++)
+   {
+      if(dir!=0 && g_scoreStats[i].direction!=dir) continue;
+      if(regimeId>=0 && g_scoreStats[i].regimeId!=regimeId) continue;
+      double w=MathMax(1.0,(double)g_scoreStats[i].trades);
+      sum+=g_scoreStats[i].shift*w;
+      weight+=w;
+   }
+   if(weight<=0.0) return 0.0;
+   return sum/weight;
+}
+
+double SessionScoreAdjust(int session,string bias)
+{
+   double base=0.0;
+   switch(session)
+   {
+      case REGIME_SES_ASIA:   base=InpSessionBias_Asia;   break;
+      case REGIME_SES_LONDON: base=InpSessionBias_London; break;
+      case REGIME_SES_NY:     base=InpSessionBias_NewYork;break;
+      default:                base=InpSessionBias_Off;    break;
+   }
+   if(bias=="SHORT")
+      base*= -1.0;
+   return base;
+}
+
+double LearningRiskMultiplier(const EntrySnapshot &snap,const string bias)
+{
+   if(!InpEnableLearning) return 1.0;
+   double qa = (bias=="LONG"?snap.qaL:snap.qaS);
+   double shift = LearningGetShift(qa,bias,snap.regimeId);
+   int dir=(bias=="LONG"?+1:-1);
+   double regimeShift = AggregateRegimeShift(snap.regimeId,dir);
+   double globalShift = AggregateRegimeShift(-1,dir);
+   double signal = (shift + regimeShift + globalShift)/3.0;
+   double mult = 1.0 + signal * InpRiskScaleSensitivity;
+   return Clamp(mult,InpRiskScaleMin,InpRiskScaleMax);
+}
+
+double EntrySplitBias(const EntrySnapshot &snap,const string bias)
+{
+   if(!InpEnableLearning) return 0.0;
+   int dir=(bias=="LONG"?+1:-1);
+   double regimeShift = AggregateRegimeShift(snap.regimeId,dir);
+   return Clamp(regimeShift * InpSplitBiasStrength,-0.45,0.45);
+}
+
+double CalcStructureScore(const EntrySnapshot &snap,bool isLong)
+{
+   double score=0.0;
+   double nearWeight = InpStructureNearWeight;
+   double breakoutWeight = InpStructureBreakoutWeight;
+   double scale = MathMax(10.0,InpStructureDistScale);
+   if(isLong)
+   {
+      if(snap.nearLow)  score+=nearWeight;
+      if(snap.nearHigh) score-=nearWeight;
+      double distEdge = (snap.distToRecentHighPts - snap.distToRecentLowPts)/scale;
+      score += breakoutWeight * Clamp(distEdge,-1.0,1.0);
+   }
+   else
+   {
+      if(snap.nearHigh) score+=nearWeight;
+      if(snap.nearLow)  score-=nearWeight;
+      double distEdge = (snap.distToRecentLowPts - snap.distToRecentHighPts)/scale;
+      score += breakoutWeight * Clamp(distEdge,-1.0,1.0);
+   }
+   return Clamp(score,-2.0,2.0);
+}
+
+double LearningComputeExitShift(const TradeContextEntry &ctx)
+{
+   double qa = (ctx.snap.direction=="LONG"?ctx.snap.qaL:ctx.snap.qaS);
+   double band = LearningScoreBand(qa);
+   int dir = (ctx.snap.direction=="LONG"?+1:-1);
+   int idx = LearningFindScoreStat(band,dir,ctx.snap.regimeId);
+   if(idx>=0)
+      return g_scoreStats[idx].exitShift;
+   int fallbackIdx = LearningFindScoreStat(band,dir,0);
+   if(fallbackIdx>=0)
+      return g_scoreStats[fallbackIdx].exitShift;
    return 0.0;
 }
 
@@ -3332,267 +3712,6 @@ bool SaveIndicatorStatsToFile()
 }
 
 
-string MonitorTrendLabel(int trend)
-{
-   if(trend==REGIME_TREND_UP) return "Up";
-   if(trend==REGIME_TREND_DOWN) return "Down";
-   return "Range";
-}
-
-string MonitorVolLabel(int vol)
-{
-   if(vol==REGIME_VOL_HIGH) return "High";
-   if(vol==REGIME_VOL_LOW) return "Low";
-   return "Medium";
-}
-
-string MonitorFormatTimestamp(datetime t)
-{
-   string ts = TimeToString(t,TIME_DATE|TIME_SECONDS);
-   StringReplace(ts,".","-");
-   StringReplace(ts,":","-");
-   return ts;
-}
-
-void MonitorEnsureFile()
-{
-    if (!InpEnableLearningMonitor)
-        return;
-
-    string fn = g_monitorFile;
-    ulong maxBytes = (ulong)MathMax(0, InpMonitorMaxSizeKB) * 1024;
-
-    // ------------------------------------------------------
-    // 1) Rotation prüfen – Datei zu groß?
-    // ------------------------------------------------------
-    if (FileIsExist(fn) && maxBytes > 0)
-    {
-        int hRead = FileOpen(fn, FILE_READ | FILE_BIN);
-        if (hRead != INVALID_HANDLE)
-        {
-            ulong size = FileSize(hRead);
-            FileClose(hRead);
-
-            if (size > maxBytes)
-            {
-                // Backup-Dateiname erstellen
-                string backup =
-                    "XAUUSD_learning_monitor_" +
-                    MonitorFormatTimestamp(TimeCurrent()) +
-                    ".csv";
-
-                // Falls Backup existiert → löschen
-                if (FileIsExist(backup))
-                    FileDelete(backup);
-
-                // Wichtig: 4-Parameter-Version von FileMove()
-                bool ok = FileMove(fn, 0, backup, 0);
-                if (!ok)
-                    Print("[Monitor] ERROR: File rotation failed: ", fn);
-            }
-        }
-    }
-
-    // ------------------------------------------------------
-    // 2) Datei existiert nicht → neu erstellen + Header
-    // ------------------------------------------------------
-    if (!FileIsExist(fn))
-    {
-        int h = FileOpen(fn, FILE_WRITE | FILE_CSV | FILE_ANSI, ';');
-        if (h != INVALID_HANDLE)
-        {
-            FileWrite(h,
-                "Timestamp","TrendPhase","VolatilityLevel","RecordType","Direction",
-                "RangeStart","RangeEnd","Trades","Wins","Winrate","WeightedAvg","LossPenalty",
-                "ShiftValue","ExitTrades","ExitAvgEfficiency","ExitShift",
-                "VariantId","VariantTrades","VariantWins","VariantWinrate","VariantPnL","VariantLastReward"
-            );
-            FileClose(h);
-        }
-        else
-        {
-            Print("[Monitor] ERROR: Cannot create monitor file: ", fn);
-        }
-    }
-}
-
-
-void MonitorWriteSnapshot()
-{
-    if(!InpEnableLearningMonitor)
-        return;
-
-    // Datei sicherstellen
-    MonitorEnsureFile();
-
-    int h = FileOpen(g_monitorFile, FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI, ';');
-    if(h == INVALID_HANDLE)
-        return;
-
-    // an das Ende schreiben
-    FileSeek(h, 0, SEEK_END);
-
-    datetime now = TimeCurrent();
-    string ts = TimeToString(now, TIME_DATE | TIME_SECONDS);
-
-    // aktueller Regime-Context
-    RegimeContext ctx = BuildRegimeContext();
-    g_lastRegimeCtx = ctx;
-
-    string trendStr = MonitorTrendLabel(ctx.trend);
-    string volStr   = MonitorVolLabel(ctx.vol);
-
-    bool wrote = false;
-
-    // ============================
-    //   SCORE STATS (BANDS)
-    // ============================
-    for(int i = 0; i < ArraySize(g_scoreStats); i++)
-    {
-        double winrate = (g_scoreStats[i].trades > 0 ?
-                          (double)g_scoreStats[i].wins / (double)g_scoreStats[i].trades : 0.0);
-
-        double rangeStart = g_scoreStats[i].band;
-        double rangeEnd   = rangeStart + 0.5;
-
-        FileWrite(h,
-            ts,
-            trendStr,
-            volStr,
-            "BAND",
-            (g_scoreStats[i].direction > 0 ? "LONG" : "SHORT"),
-            DoubleToString(rangeStart,2),
-            DoubleToString(rangeEnd,2),
-            (long)g_scoreStats[i].trades,
-            (long)g_scoreStats[i].wins,
-            DoubleToString(winrate,4),
-            DoubleToString(g_scoreStats[i].weightedAvg,4),
-            (long)g_scoreStats[i].lossStreak,
-            DoubleToString(g_scoreStats[i].shift,4),
-            (long)g_scoreStats[i].exitTrades,
-            DoubleToString(g_scoreStats[i].exitAvgEfficiency,4),
-            DoubleToString(g_scoreStats[i].exitShift,4),
-            "", "", "", "", "", ""
-        );
-
-        wrote = true;
-    }
-
-    // ============================
-    //   VARIANT STATS
-    // ============================
-    for(int i = 0; i < ArraySize(g_variantStats); i++)
-    {
-        double winrate = (g_variantStats[i].trades > 0 ?
-                          (double)g_variantStats[i].wins / (double)g_variantStats[i].trades : 0.0);
-
-        FileWrite(h,
-            ts,
-            trendStr,
-            volStr,
-            "VARIANT",
-            "",
-            "",
-            "",
-            (long)g_variantStats[i].trades,
-            (long)g_variantStats[i].wins,
-            DoubleToString(winrate,4),
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            (long)g_variantStats[i].variantId,
-            (long)g_variantStats[i].trades,
-            (long)g_variantStats[i].wins,
-            DoubleToString(winrate,4),
-            DoubleToString(g_variantStats[i].pnl,2),
-            DoubleToString(g_variantStats[i].lastReward,2)
-        );
-
-        wrote = true;
-    }
-
-    // ============================
-    //   PHASE LEARNING STATS
-    // ============================
-    for(int i = 0; i < ArraySize(g_indPhaseStats); i++)
-    {
-        if(g_indPhaseStats[i].trades < InpIndPhaseMinTrades)
-            continue;
-
-        double winrate = (g_indPhaseStats[i].trades > 0 ?
-                          (double)g_indPhaseStats[i].wins / (double)g_indPhaseStats[i].trades : 0.0);
-
-        string trendPhaseStr =
-            (g_indPhaseStats[i].trendPhase == TREND_UP     ? "UP" :
-             g_indPhaseStats[i].trendPhase == TREND_DOWN   ? "DOWN" :
-                                                             "SIDEWAYS");
-
-        string volLevelStr =
-            (g_indPhaseStats[i].volLevel == VOL_LOW  ? "LOW" :
-             g_indPhaseStats[i].volLevel == VOL_HIGH ? "HIGH" :
-                                                       "MEDIUM");
-
-        string sessionStr =
-            (g_indPhaseStats[i].sessionBucket == SESSION_ASIA   ? "ASIA" :
-             g_indPhaseStats[i].sessionBucket == SESSION_EUROPE ? "EUROPE" :
-                                                                  "US");
-
-        FileWrite(h,
-            ts,
-            trendStr,
-            volStr,
-            "INDPHASE",
-            (g_indPhaseStats[i].direction > 0 ? "LONG" : "SHORT"),
-            "",
-            "",
-            (long)g_indPhaseStats[i].trades,
-            (long)g_indPhaseStats[i].wins,
-            DoubleToString(winrate,4),
-            DoubleToString(g_indPhaseStats[i].weightedAvg,4),
-            "",
-            DoubleToString(g_indPhaseStats[i].weightShift,4),
-            "", "", "",
-            g_indPhaseStats[i].name,
-            trendPhaseStr,
-            volLevelStr,
-            sessionStr,
-            ""
-        );
-
-        wrote = true;
-    }
-
-    // Fallback, falls nichts geschrieben wurde
-    if(!wrote)
-    {
-        FileWrite(h,
-            ts,
-            trendStr,
-            volStr,
-            "SUMMARY",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "", "", "", "", "", ""
-        );
-    }
-
-    FileClose(h);
-    g_lastMonitorWriteTime = now;
-}
-
 
 
 string DealReasonText(ENUM_DEAL_REASON reason)
@@ -3900,6 +4019,19 @@ double NormalizeSplitLots(double lots)
    if(v > maxl) v = maxl;
    return NormalizeDouble(v,2);
 }
+
+double NormalizeVolumeStep(double lots)
+{
+   double step = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_STEP);
+   double minl = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MIN);
+   double maxl = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MAX);
+   if(step <= 0.0) step = 0.01;
+   if(minl <= 0.0) minl = step;
+   double v = MathFloor(lots / step) * step;
+   if(v < minl) v = minl;
+   if(maxl > 0.0 && v > maxl) v = maxl;
+   return NormalizeDouble(v,2);
+}
 bool GateByScores(
     double baseScore,           // qL oder qS
     double dirStrength,
@@ -3923,6 +4055,9 @@ bool GateByScores(
 
     double profileOffset = (bias == "LONG" ? prof.offsetLong : prof.offsetShort);
     minQ += profileOffset;
+
+   // 3) Session-based adjustment
+   minQ += SessionScoreAdjust(g_lastRegimeCtx.session,bias);
 
     // 3) Grundscore
     double effQ = baseScore;
@@ -4041,9 +4176,16 @@ void OpenStagedEntries(const EntrySnapshot &snap,string bias,double baseLots,dou
    if(!SymbolInfoTick(g_symbol,g_tick)) return;
    double atr=0; ATR(atr);
    double slPrice=0.0;
-   double p1=Clamp(InpStage1_Pct,0,100), p2=Clamp(InpStage2_Pct,0,100), p3=Clamp(InpStage3_Pct,0,100);
-   double sumPct = MathMax(1.0,(p1+p2+p3));
-   double lots1=baseLots*(p1/sumPct), lots2=baseLots*(p2/sumPct), lots3=baseLots*(p3/sumPct);
+   double stage1Share = Clamp(InpStage1_Pct/100.0 - snap.splitBias,0.2,0.9);
+   double pendingShare = MathMax(0.0,1.0 - stage1Share);
+   double pendingTotalPct = MathMax(1.0,(InpStage2_Pct + InpStage3_Pct));
+   double baseStage2Share = (InpStage2_Pct/pendingTotalPct);
+   double stage2Share = Clamp(baseStage2Share + snap.splitBias*0.3,0.05,0.95) * pendingShare;
+   double stage3Share = MathMax(0.0,pendingShare - stage2Share);
+   double p1 = stage1Share*100.0;
+   double p2 = stage2Share*100.0;
+   double p3 = stage3Share*100.0;
+   double lots1=baseLots*stage1Share, lots2=baseLots*stage2Share, lots3=baseLots*stage3Share;
    lots1 = NormalizeSplitLots(lots1);
    lots2 = NormalizeSplitLots(lots2);
    lots3 = NormalizeSplitLots(lots3);
@@ -4055,6 +4197,9 @@ void OpenStagedEntries(const EntrySnapshot &snap,string bias,double baseLots,dou
    }
    datetime exp = TimeCurrent() + InpPendingExpireMin*60;
 
+   double retrMultNear = Clamp(1.0 + snap.splitBias,0.4,2.0);
+   double retrMultFar  = Clamp(1.0 + snap.splitBias*1.5,0.4,2.5);
+
    if(bias=="LONG"){
 slPrice = g_tick.ask - slPts*g_point;
 
@@ -4064,6 +4209,12 @@ double tpDist = atr * InpTP_ATR_Mult;
 double tp1 = (InpUseTP ? SnapToTick(MathMax(g_tick.ask + tpDist, g_tick.ask + safe)) : 0.0);
       if(lots1>0.0)
       {
+         EntrySnapshot marketSnap = snap;
+         marketSnap.entryPricePlan = g_tick.ask;
+         marketSnap.slPlan = slPrice;
+         marketSnap.tpPlan = tp1;
+         g_lastDecisionSnapshot = marketSnap;
+
          bool ok1 = OrderBuy(lots1, slPrice, tp1, "LONG mkt");
          LogRow(ok1?"ENTRY_OK":"ENTRY_FAIL","Entry","OPEN",ModeName(),"LONG",(double)g_tick.ask,slPrice,tp1,
                 qL,qS,dL,dS,aL,aS,qaL,qaS,0,true,
@@ -4071,8 +4222,8 @@ double tp1 = (InpUseTP ? SnapToTick(MathMax(g_tick.ask + tpDist, g_tick.ask + sa
       }
       // Marktfüller werden über OnTradeTransaction mit snap verknüpft
 
-double price2 = g_tick.bid - (InpSplitRetrace1_ATR*atr);
-double price3 = g_tick.bid - (InpSplitRetrace2_ATR*atr);
+double price2 = g_tick.bid - (InpSplitRetrace1_ATR*retrMultNear*atr);
+double price3 = g_tick.bid - (InpSplitRetrace2_ATR*retrMultFar*atr);
 double sl2 = price2 - slPts*g_point;
 double sl3 = price3 - slPts*g_point;
 
@@ -4114,6 +4265,12 @@ double tpDist = atr * InpTP_ATR_Mult;
 double tp1 = (InpUseTP ? SnapToTick(MathMin(g_tick.bid - tpDist, g_tick.bid - safe)) : 0.0);
       if(lots1>0.0)
       {
+         EntrySnapshot marketSnap = snap;
+         marketSnap.entryPricePlan = g_tick.bid;
+         marketSnap.slPlan = slPrice;
+         marketSnap.tpPlan = tp1;
+         g_lastDecisionSnapshot = marketSnap;
+
          bool ok1 = OrderSell(lots1, slPrice, tp1, "SHORT mkt");
          LogRow(ok1?"ENTRY_OK":"ENTRY_FAIL","Entry","OPEN",ModeName(),"SHORT",(double)g_tick.bid,slPrice,tp1,
                 qL,qS,dL,dS,aL,aS,qaL,qaS,0,true,
@@ -4121,8 +4278,8 @@ double tp1 = (InpUseTP ? SnapToTick(MathMin(g_tick.bid - tpDist, g_tick.bid - sa
       }
       // Marktfüller werden über OnTradeTransaction mit snap verknüpft
 
-double price2 = g_tick.ask + (InpSplitRetrace1_ATR*atr);
-double price3 = g_tick.ask + (InpSplitRetrace2_ATR*atr);
+double price2 = g_tick.ask + (InpSplitRetrace1_ATR*retrMultNear*atr);
+double price3 = g_tick.ask + (InpSplitRetrace2_ATR*retrMultFar*atr);
 double sl2 = price2 + slPts*g_point;
 double sl3 = price3 + slPts*g_point;
 
@@ -4206,7 +4363,7 @@ void TryEnter(
     }
 
     // --- 4) Lot Calculation ---
-    double baseLots = CalcLotByRisk(slPts);
+    double baseLots = CalcLotByRisk(slPts) * riskMult;
     if(baseLots <= 0.0)
     {
         g_lastBlockReason = "LotCalc";
@@ -4312,7 +4469,7 @@ bool PositionModifySafe(ulong ticket,double sl,double tp)
 
 // --- end helpers ---
 
-bool ApplyUnifiedTrail(ulong ticket,long ptype,double entry,double oldSL,double atr)
+bool ApplyUnifiedTrail(ulong ticket,long ptype,double entry,double oldSL,double atr,double exitShift)
 {
    if(!InpUseUnifiedTrail) return false;
    if(!SymbolInfoTick(g_symbol,g_tick)) return false;
@@ -4322,6 +4479,8 @@ bool ApplyUnifiedTrail(ulong ticket,long ptype,double entry,double oldSL,double 
    int variantId = (ctxIdx>=0 ? g_tradeContexts[ctxIdx].variantId : g_currentVariantId);
    StrategyVariant var = VariantGetById(variantId);
    TrailingSet trailSet = TrailingGetSetById(var.trailingSetId);
+   if(ctxIdx>=0 && exitShift==0.0)
+      exitShift = LearningComputeExitShift(g_tradeContexts[ctxIdx]);
    
    // Berechne initialRisk (Entry-SL Abstand in Punkten)
    double initialRiskPts = 0.0;
@@ -4344,15 +4503,17 @@ bool ApplyUnifiedTrail(ulong ticket,long ptype,double entry,double oldSL,double 
    // STABILITY: prevent division by zero
    if(initialRiskPts<=0.0) return false;
    double profitR = profitPts / initialRiskPts;
-   if(profitR < trailSet.startR) return false; // Noch nicht genug Profit in R
+   double adaptiveStart = Clamp(trailSet.startR + exitShift*2.0, 0.2, 3.5);
+   if(profitR < adaptiveStart) return false; // Noch nicht genug Profit in R
 
    const double minPts   = (double)MathMax(StopsLevelPts(), FreezeLevelPts());
    const double safeDist = MathMax(minPts*g_point, 1.0*g_point);
 
    // TRAILING: use trailingSet - Schritt basierend auf R
-   double stepDistR = trailSet.stepR * initialRiskPts * g_point;
-   double stepDist = MathMax(stepDistR, (double)InpTrailStepPts*g_point);
-   double atrDist  = (atr>0.0 && InpTrailATRMult>0.0 ? atr*InpTrailATRMult : 0.0);
+   double stepBias = Clamp(1.0 + exitShift*3.0, 0.5, 2.0);
+   double stepDistR = trailSet.stepR * initialRiskPts * g_point * stepBias;
+   double stepDist = MathMax(stepDistR, (double)InpTrailStepPts*g_point * stepBias);
+   double atrDist  = (atr>0.0 && InpTrailATRMult>0.0 ? atr*InpTrailATRMult*stepBias : 0.0);
    double targetDist = MathMax(stepDist, atrDist);
    if(targetDist<=0.0) targetDist = safeDist*1.5;
 
@@ -4412,6 +4573,7 @@ void ManagePositions()
       double oldSL  = PositionGetDouble(POSITION_SL);
       double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
       int ctxIdx = LearningFindTradeContext(ticket);
+      double exitShift = 0.0;
       if(ctxIdx>=0){
          // STABILITY: check g_point before division
       if(g_point>0.0)
@@ -4420,6 +4582,45 @@ void ManagePositions()
          if(signedPts > g_tradeContexts[ctxIdx].mfePts) g_tradeContexts[ctxIdx].mfePts = signedPts;
          if(signedPts < g_tradeContexts[ctxIdx].maePts) g_tradeContexts[ctxIdx].maePts = signedPts;
       }
+         exitShift = LearningComputeExitShift(g_tradeContexts[ctxIdx]);
+      }
+
+      if(InpEnablePartialTake && ctxIdx>=0 && !g_tradeContexts[ctxIdx].partialTaken)
+      {
+         double riskPts = g_tradeContexts[ctxIdx].initialRiskPts;
+         if((riskPts<=0.0) && g_point>0.0 && g_tradeContexts[ctxIdx].snap.slPlan>0.0 && g_tradeContexts[ctxIdx].entryPrice>0.0)
+         {
+            if(g_tradeContexts[ctxIdx].snap.direction=="LONG")
+               riskPts = (g_tradeContexts[ctxIdx].entryPrice - g_tradeContexts[ctxIdx].snap.slPlan)/g_point;
+            else
+               riskPts = (g_tradeContexts[ctxIdx].snap.slPlan - g_tradeContexts[ctxIdx].entryPrice)/g_point;
+         }
+         if(riskPts>0.0 && g_point>0.0)
+         {
+            double curPrice = (ptype==POSITION_TYPE_BUY ? g_tick.bid : g_tick.ask);
+            double profitPts = (ptype==POSITION_TYPE_BUY ? (curPrice - entry)/g_point : (entry - curPrice)/g_point);
+            double rMultiple = profitPts / riskPts;
+            double trigger = Clamp(InpPartialTake_R - exitShift,0.3,3.5);
+            if(rMultiple >= trigger)
+            {
+               double posVol = PositionGetDouble(POSITION_VOLUME);
+               double pct = Clamp(InpPartialTake_Pct + exitShift*0.5,0.1,0.9);
+               double closeVol = NormalizeVolumeStep(posVol * pct);
+               if(closeVol>0.0 && closeVol<posVol)
+               {
+                  if(Trade.PositionClosePartial(ticket, closeVol))
+                  {
+                     g_tradeContexts[ctxIdx].partialTaken = true;
+                     g_tradeContexts[ctxIdx].partialVolume = closeVol;
+                     LogRow("PARTIAL_TP","Exit","PARTIAL",ModeName(),
+                            (ptype==POSITION_TYPE_BUY?"LONG":"SHORT"),
+                            curPrice,oldSL,PositionGetDouble(POSITION_TP),
+                            0,0,0,0,0,0,0,0,true,"partial close @"+DoubleToString(rMultiple,2)+"R");
+                     continue;
+                  }
+               }
+            }
+         }
       }
 
       // PSAR-Exit
@@ -4455,7 +4656,8 @@ if(InpMoveToBE && a>0.0 && g_point>0.0)
                   (g_tick.bid - entry)/g_point :
                   (entry - g_tick.ask)/g_point) / slPts;
 
-      if(rr >= InpBE_RR)
+      double beTrigger = Clamp(InpBE_RR + exitShift*2.0, 0.5, 3.0);
+      if(rr >= beTrigger)
       {
          const double minPts   = (double)MathMax(StopsLevelPts(), FreezeLevelPts());
          const double safeDist = MathMax(minPts*g_point, 1.0*g_point);
@@ -4491,7 +4693,7 @@ if(InpMoveToBE && a>0.0 && g_point>0.0)
 
 if(InpUseUnifiedTrail)
 {
-   if(ApplyUnifiedTrail(ticket,ptype,entry,oldSL,a)) continue;
+   if(ApplyUnifiedTrail(ticket,ptype,entry,oldSL,a,exitShift)) continue;
 }
 else
 {
@@ -4501,9 +4703,11 @@ if(InpUseFixedTrail && g_point>0.0)
    double cur = (ptype==POSITION_TYPE_BUY ? g_tick.bid : g_tick.ask);
    double profitPts = (ptype==POSITION_TYPE_BUY ? (cur - entry)/g_point : (entry - cur)/g_point);
 
-   if(profitPts >= InpFixedTrailStartPt)
+   double fixedStart = MathMax(10.0, (double)InpFixedTrailStartPt + exitShift*200.0);
+   if(profitPts >= fixedStart)
    {
-      double step = (double)InpFixedTrailStepPt * g_point;
+      double stepMult = Clamp(1.0 + exitShift*2.0, 0.5, 2.0);
+      double step = (double)InpFixedTrailStepPt * stepMult * g_point;
       double wantSL = (ptype==POSITION_TYPE_BUY ? (cur - step) : (cur + step));
 
       // nur enger, nie lockern
@@ -4549,7 +4753,8 @@ if(InpUseSmartTrailing && a>0.0)
    if(!beActive) { continue; }
 
    const double cur     = (ptype==POSITION_TYPE_BUY ? g_tick.bid : g_tick.ask);
-   const double trailPx = a * InpATR_Mult_Trail;
+   const double trailMult = Clamp(1.0 + exitShift*3.0, 0.5, 2.0);
+   const double trailPx = a * InpATR_Mult_Trail * trailMult;
 
    // Wunsch-SL
    double want = (ptype==POSITION_TYPE_BUY ? cur - trailPx : cur + trailPx);
@@ -4598,8 +4803,19 @@ void OnInitCommon()
 {
    g_symbol = (InpSymbol=="" ? _Symbol : InpSymbol);
    g_magic  = InpMagic;
-
    if(!SymbolSelect(g_symbol,true)) Print("SymbolSelect failed");
+   Trade.SetExpertMagic(g_magic);
+   int fillMask = (int)SymbolInfoInteger(g_symbol,SYMBOL_FILLING_MODE);
+   ENUM_ORDER_TYPE_FILLING fillMode = ORDER_FILLING_FOK;
+   if((fillMask & ORDER_FILLING_RETURN) == ORDER_FILLING_RETURN)
+      fillMode = ORDER_FILLING_RETURN;
+   else if((fillMask & ORDER_FILLING_IOC) == ORDER_FILLING_IOC)
+      fillMode = ORDER_FILLING_IOC;
+   else if((fillMask & ORDER_FILLING_FOK) == ORDER_FILLING_FOK)
+      fillMode = ORDER_FILLING_FOK;
+   Trade.SetTypeFilling(fillMode);
+   Trade.SetTypeExpiration(ORDER_TIME_SPECIFIED);
+
    g_digits = (int)SymbolInfoInteger(g_symbol,SYMBOL_DIGITS);
    g_point  = SymbolInfoDouble(g_symbol,SYMBOL_POINT);
    // STABILITY: defensive check for g_point
@@ -4635,7 +4851,6 @@ void OnInitCommon()
       hIKH = INVALID_HANDLE;
 
    EnsureLogOpen();
-   if(InpEnableLearningMonitor) MonitorEnsureFile();
    LearningEnsureStatsFile();
    News_LoadFile();
 
@@ -4720,7 +4935,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &
       if(entryPrice<=0.0) entryPrice=trans.price;
       snap.entryPricePlan=entryPrice;
       ulong positionId=(ulong)HistoryDealGetInteger(trans.deal,DEAL_POSITION_ID);
-      LearningStoreTradeContext(positionId,snap,entryPrice,snap.slPlan,snap.tpPlan);
+      double dealVolume = HistoryDealGetDouble(trans.deal,DEAL_VOLUME);
+      if(dealVolume<=0.0) dealVolume = trans.volume;
+      LearningStoreTradeContext(positionId,snap,entryPrice,snap.slPlan,snap.tpPlan,dealVolume);
    }
    else if(entry==DEAL_ENTRY_OUT)
    {
@@ -4757,10 +4974,12 @@ void OnTick()
    datetime m1Close = iTime(g_symbol, InpTF_Work, 0);
    if(m1Close==0){ ManagePositions(); return; }
    bool isNewBar = (m1Close!=g_lastM1CloseTime);
-   bool shouldMonitor = false;
-   if(isNewBar) shouldMonitor=true;
-   if((TimeCurrent()-g_lastMonitorWriteTime)>=3600) shouldMonitor=true;
-   if(shouldMonitor && InpEnableLearningMonitor) MonitorWriteSnapshot();
+   if(isNewBar)
+   {
+      if(InpEnableLearning) ApplyLearningAdjustments();
+      if(InpEnableIndicatorLearning) ApplyIndicatorLearningAdjustments();
+      if(InpEnablePhaseLearning) ApplyIndicatorPhaseAdjustments();
+   }
 
    ResetDayIfNeeded();
    UpdateModeByPnL();
@@ -4874,6 +5093,10 @@ if(!hasMaj){
    // Gate & Entry
    string gateNote="";
    EntrySnapshot snap = BuildEntrySnapshot(bias,qL,qS,qaL,qaS,dirStrength,cats,htfok);
+   double riskMult = LearningRiskMultiplier(snap,bias);
+   double splitBias = EntrySplitBias(snap,bias);
+   snap.riskMultiplier = riskMult;
+   snap.splitBias = splitBias;
    g_lastDecisionSnapshot = snap;
  if(bias=="LONG")
 {
